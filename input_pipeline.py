@@ -70,7 +70,8 @@ class PuzzleDataset(Dataset):
         return len(self._data['inputs'])
     
     def __str__(self):
-        return f"PuzzleDataset\n\t- split: {self.split}\n\t- size: {len(self)}\n\t- metadata: {self.metadata}"
+        md = '\n\t\t'.join([f"{k}: {v}" for k, v in self.metadata.model_dump().items()])
+        return f"{self.__class__.__name__}\n\t- split: {self.split}\n\t- size: {len(self)}\n\t- metadata:\n\t\t{md}"
 
 class SudokuDataset(PuzzleDataset):
     def _load_metadata(self):

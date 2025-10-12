@@ -11,12 +11,14 @@ import math
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
+from functools import partial
 
 # from models.common import trunc_normal_init_
 trunc_normal_init_ = jax.nn.initializers.truncated_normal(stddev=1.0)
 from models.layers import rms_norm, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
 
+SG = jax.lax.stop_gradient
 
 # @dataclass
 @struct.dataclass
@@ -138,8 +140,8 @@ class HRM_ACTV1(nn.Module):
 
         # Initial states
         # These states are not trainble, and also will NOT be updated
-        self.H_init = self.variable('const', 'H_init', trunc_normal_init_, self.make_rng('const'), (self.hidden_size,))
-        self.L_init = self.variable('const', 'L_init', trunc_normal_init_, self.make_rng('const'), (self.hidden_size,))
+        self.H_init = self.variable('const', 'H_init', lambda: trunc_normal_init_(self.make_rng('const'), (self.hidden_size,)))
+        self.L_init = self.variable('const', 'L_init', lambda: trunc_normal_init_(self.make_rng('const'), (self.hidden_size,)))
 
         self.carry = self.variable('buffer', 'carry', lambda: None)
 
@@ -174,7 +176,7 @@ class HRM_ACTV1(nn.Module):
             ),
             steps=jnp.zeros((batch_size, ), dtype=jnp.int32),
             halted=jnp.ones((batch_size, ), dtype=jnp.bool_),  # Default to halted
-            current_data={}
+            current_data={"inputs": 0, "labels": 0, "puzzle_identifiers": 0}
         )
 
     def _update_carry(self):
@@ -183,14 +185,18 @@ class HRM_ACTV1(nn.Module):
         """
         reset_flag = self.carry.value.halted
         carry = self.carry.value
-        self.carry.value = InnerCarry(
-            z_H=jnp.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
-            z_L=jnp.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
-        )
+        self.carry.value = self.carry.value.replace(inner_carry=InnerCarry(
+            z_H=jnp.where(reset_flag.reshape((-1, 1, 1)), self.H_init.value, carry.inner_carry.z_H),
+            z_L=jnp.where(reset_flag.reshape((-1, 1, 1)), self.L_init.value, carry.inner_carry.z_L),
+        ))
+        # self.carry.value.inner_carry = InnerCarry(
+        #     z_H=jnp.where(reset_flag.reshape((-1, 1, 1)), self.H_init.value, carry.inner_carry.z_H),
+        #     z_L=jnp.where(reset_flag.reshape((-1, 1, 1)), self.L_init.value, carry.inner_carry.z_L),
+        # )
 
     def _inner_step(self, batch: FrozenDict[str, jnp.ndarray], update_inner_carry: bool):
         cos_sin = self.rotary_emb() if self.pos_encodings == "rope" else None
-        carry = self.carry.value
+        carry = self.carry.value.inner_carry
 
         # Input encoding
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
@@ -201,30 +207,30 @@ class HRM_ACTV1(nn.Module):
         # TODO{zhh}: change to for-i-loop?
         for _H_step in range(self.H_cycles):
             for _L_step in range(self.L_cycles):
-                if not ((_H_step == self.H_cycles - 1) and (_L_step == self.config.L_cycles - 1)):
+                if not ((_H_step == self.H_cycles - 1) and (_L_step == self.L_cycles - 1)):
                     z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin)
 
             if not (_H_step == self.H_cycles - 1):
                 z_H = self.H_level(z_H, z_L, cos_sin=cos_sin)
 
-        z_H = jax.lax.stop_gradient(z_H)
-        z_L = jax.lax.stop_gradient(z_L)
+        z_H = SG(z_H)
+        z_L = SG(z_L)
 
         # 1-step grad
         z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin)
         z_H = self.H_level(z_H, z_L, cos_sin=cos_sin)
 
         # LM Outputs
-        new_carry = InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
+        new_carry = InnerCarry(z_H=SG(z_H), z_L=SG(z_L))
         
         if update_inner_carry:
-            self.carry.value.inner_carry = new_carry # overwrite inner carry
+            self.carry.value = self.carry.value.replace(inner_carry=new_carry) # overwrite inner carry
         
         # New carry no grad
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
 
         # Q head
-        q_logits = self.q_head(z_H[:, 0]).to(jnp.float32)
+        q_logits = self.q_head(z_H[:, 0]).astype(jnp.float32)
         
         return output, (q_logits[..., 0], q_logits[..., 1])
 
@@ -236,7 +242,7 @@ class HRM_ACTV1(nn.Module):
         carry = self.carry.value
         
         new_steps = jnp.where(carry.halted, 0, carry.steps)
-        new_current_data = {k: jnp.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
+        new_current_data = {k: jnp.where(carry.halted.reshape((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
         
         # Forward inner step
         logits, (q_halt_logits, q_continue_logits) = self._inner_step(new_current_data, update_inner_carry=True)
@@ -274,16 +280,19 @@ class HRM_ACTV1(nn.Module):
 
             outputs["target_q_continue"] = jax.nn.sigmoid(jnp.where(is_last_step, next_q_halt_logits, jnp.maximum(next_q_halt_logits, next_q_continue_logits)))
 
-        self.carry.value.steps = new_steps
-        self.carry.value.halted = halted
-        self.carry.value.current_data = new_current_data
+        self.carry.value = self.carry.value.replace(
+            steps=new_steps,
+            halted=halted,
+            current_data=new_current_data
+        )
         return outputs
     
     def init_fn(self, batch: FrozenDict[str, jnp.ndarray]):
         self._init_carry(batch["inputs"].shape[0])
+        self._update_carry() # Use this, otherwise H_init will not be inited
         return self._inner_step(batch, update_inner_carry=False)[0]
 
-    def while_loop(self, batch: FrozenDict[str, jnp.ndarray]):
+    def inference(self, batch: FrozenDict[str, jnp.ndarray]):
         # during inference, rewrite the carry to null
         self._init_carry(batch["inputs"].shape[0])
         # call once
@@ -293,12 +302,28 @@ class HRM_ACTV1(nn.Module):
             return module.carry.value.halted.all()
         
         def body_fun(module, output):
-            return self(batch, None, train=False)
+            return module(batch, None, train=False)
 
-        out = nn.while_loop(cond_fun, body_fun, self, output, carry_variables='buffer')
-        
-        return out
-    
+        return nn.while_loop(cond_fun, body_fun, self, output, carry_variables='buffer')
+
+HRM_debug = partial(HRM_ACTV1, H_cycles=2, L_cycles=2, H_layers=1, L_layers=1, halt_max_steps=2, halt_exploration_prob=0.1, hidden_size=4, num_heads=2, expansion=1.0)
+HRM_default = partial(HRM_ACTV1, H_cycles=2, L_cycles=2, H_layers=4, L_layers=4, halt_max_steps=16, halt_exploration_prob=0.1)
+
 if __name__ == "__main__":
     # TODO{zhh}: perform model test here
-    pass
+    inputs = jnp.ones((7, 81), dtype=jnp.int32)
+    labels = jnp.ones((7, 81), dtype=jnp.int32)
+    identifiers = jnp.zeros((7,), dtype=jnp.int32)
+    batch = {"inputs": inputs, "labels": labels, "puzzle_identifiers": identifiers}
+    model = HRM_debug(batch_size=7, seq_len=81, vocab_size=11, num_puzzle_identifiers=1)
+    # model = Foo()
+    variables = model.init({'params': jax.random.PRNGKey(0), 'const': jax.random.PRNGKey(0)}, batch, method=model.init_fn,)# mutable=['buffer', 'const'])
+    print('init passed')
+    print('variables:', variables.keys())
+    print('buffer:', variables['buffer'])
+    output, new_variables = model.apply(variables, batch, rng=jax.random.PRNGKey(0), train=True, mutable=['buffer'])
+    print('shape test passed')
+    output, new_variables = model.apply(variables, batch, mutable=['buffer'], method=model.inference)
+    print('inference test passed')
+
+    print('const vals:', variables['const']['H_init'], variables['const']['L_init'])

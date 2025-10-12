@@ -30,14 +30,14 @@ def rotate_half(x: jnp.ndarray):
 
 
 def apply_rotary_pos_emb(q: jnp.ndarray, k: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray):
+    assert cos.ndim == sin.ndim == 2
     # q, k: [bs, seq_len, num_heads, head_dim]
     # cos, sin: [seq_len, head_dim]
     orig_dtype = q.dtype
     q = q.astype(cos.dtype)
     k = k.astype(cos.dtype)
-
-    q_embed = (q * cos[None, :]) + (rotate_half(q) * sin[None, :])
-    k_embed = (k * cos[None, :]) + (rotate_half(k) * sin[None, :])
+    q_embed = (q * cos[:, None, :]) + (rotate_half(q) * sin[:, None, :])
+    k_embed = (k * cos[:, None, :]) + (rotate_half(k) * sin[:, None, :])
 
     return q_embed.astype(orig_dtype), k_embed.astype(orig_dtype)
 
@@ -46,15 +46,17 @@ class CastedLinear(nn.Module):
     in_features: int
     out_features: int
     bias: bool
+    initialization: str = 'default' # 'default' or '-5'
     
     @nn.compact
     def __call__(self, input):
+        assert self.initialization in ['default', '-5'], f"Unknown initialization {self.initialization}"
         return nn.Dense(
             self.out_features,
             use_bias=self.bias,
-            kernel_init=trunc_normal_init_(stddev=1.0 / (self.in_features ** 0.5)),
-            bias_init=nn.initializers.zeros
-        )
+            kernel_init=trunc_normal_init_(stddev=1.0 / (self.in_features ** 0.5)) if self.initialization == 'default' else nn.initializers.zeros,
+            bias_init=nn.initializers.zeros if self.initialization == 'default' else nn.initializers.constant(-5.0)
+        )(input)
 
 class CastedEmbedding(nn.Module):
     num_embeddings: int
@@ -99,6 +101,8 @@ class Attention(nn.Module):
         self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
         self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
         
+        assert self.causal is False, 'Unsupported'
+        
     def __call__(self, cos_sin: CosSin, hidden_states: jnp.ndarray):
         batch_size, seq_len, _ = hidden_states.shape
         qkv = self.qkv_proj(hidden_states)
@@ -111,7 +115,7 @@ class Attention(nn.Module):
             cos, sin = cos_sin
             query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
-        attn_output = nn.attention.dot_product_attention(query, key, value, causal=self.causal)
+        attn_output = nn.attention.dot_product_attention(query, key, value)
         return self.o_proj(attn_output.reshape(batch_size, seq_len, self.output_size))
 
 
@@ -125,8 +129,8 @@ class SwiGLU(nn.Module):
         self.gate_up_proj = CastedLinear(self.hidden_size, inter * 2, bias=False)
         self.down_proj    = CastedLinear(inter, self.hidden_size, bias=False)
 
-    def forward(self, x):
-        gate, up = self.gate_up_proj(x).split(2, axis=-1)
+    def __call__(self, x):
+        gate, up = jnp.split(self.gate_up_proj(x), 2, axis=-1)
         return self.down_proj(nn.silu(gate) * up)
 
 def rms_norm(hidden_states: jnp.ndarray, variance_epsilon: float) -> jnp.ndarray:

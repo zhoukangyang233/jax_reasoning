@@ -25,6 +25,7 @@ LDC = jax.local_device_count()
 
 class MutableTrainState(train_state.TrainState):
     buffers: dict
+    consts: dict
     lr_fn: struct.field(pytree_node=False)
     model: struct.field(pytree_node=False)
 
@@ -32,7 +33,7 @@ class MutableTrainState(train_state.TrainState):
 # train state creation
 def create_train_state(rng, config, total_steps):
     model_cls = getattr(models, config.model.name)
-    model = model_cls(**{k: v for k, v in config.model.to_dict().items() if k != "name"})
+    model = model_cls(**{k: v for k, v in config.model.to_dict().items() if k != "name"}, **{'seq_len': config.dataset.seq_len, 'vocab_size': config.dataset.vocab_size, 'num_puzzle_identifiers': config.dataset.num_puzzle_identifiers})
     fake_batch_shape = {
         'inputs': (2, config.dataset.seq_len),
         'labels': (2, config.dataset.seq_len),
@@ -41,13 +42,15 @@ def create_train_state(rng, config, total_steps):
     fake_batch = {k: jnp.ones(v, dtype=jnp.int32) for k, v in fake_batch_shape.items()}
     
     rng, init_rng = jax.random.split(rng)
-    model_variables = jax.jit(partial(model.init, method=model.init_fn))(fake_batch)
-    
+    params_init_rng, const_init_rng = jax.random.split(init_rng, 2)
+    model_variables = jax.jit(partial(model.init, method=model.init_fn))(fake_batch, rngs={'params': params_init_rng, 'const': const_init_rng})
+
     tx, lr_fn = optimizers.build_optimizer(config.training, total_steps)
     
     state = MutableTrainState.create(
         params=model_variables['params'],
-        buffers=model_variables.get('buffers', {}),
+        buffers=model_variables['buffer'],
+        consts=model_variables['const'],
         tx=tx,
         apply_fn=model.apply,
         lr_fn=lr_fn,
@@ -146,9 +149,9 @@ def train_step(state: MutableTrainState, batch, loss_fn, init_rng):
     rng_step = jax.random.fold_in(jax.random.PRNGKey(0), state.step)
     def L(params):
         variables = {'params': params, 'buffers': state.buffers}
-        out, new_model_state = state.apply_fn(variables, batch, mutable=['buffers'], train=True)
-        loss, metrics = act_loss_and_metrics(new_model_state['buffers'], out, loss_fn, train=True)
-        return loss, (metrics, new_model_state['buffers'])
+        out, new_model_state = state.apply_fn(variables, batch, mutable=['buffer'], train=True)
+        loss, metrics = act_loss_and_metrics(new_model_state['buffer'], out, loss_fn, train=True)
+        return loss, (metrics, new_model_state['buffer'])
     grad_fn = jax.value_and_grad(L, has_aux=True)
     (loss, (metrics, new_buffers)), grads = grad_fn(state.params)
     grads = jax.lax.pmean(grads, axis_name='batch')
@@ -159,7 +162,7 @@ def train_step(state: MutableTrainState, batch, loss_fn, init_rng):
 
 def eval_step(state: MutableTrainState, batch, loss_fn):
     variables = {'params': state.params, 'buffers': state.buffers}
-    out, _ = state.apply_fn(variables, batch, mutable=['buffers'], train=False)
+    out, _ = state.model.apply(variables, batch, mutable=['buffer'], method=state.model.inference)
     _, metrics = act_loss_and_metrics(state.buffers, out, loss_fn, train=False)
     return compute_metrics(metrics)
 
@@ -185,6 +188,7 @@ def train_and_evaluate(config, workdir):
     dataset_cfg = config.dataset
     global_batch_size = config.training.batch_size
     global_eval_batch_size = config.training.eval_batch_size
+    assert global_batch_size == global_eval_batch_size, "Not implemented two different batch sizes"
     device_batch_size = global_batch_size // PCC
     device_eval_batch_size = global_eval_batch_size // PCC
     assert global_batch_size % (PCC) == 0 and device_batch_size % LDC == 0, f"global_batch_size: {global_batch_size}, PCC: {PCC}, LDC: {LDC}, local_batch_size: {device_batch_size}"
