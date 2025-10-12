@@ -1,0 +1,304 @@
+from typing import Tuple, List, Dict, Optional
+# from dataclasses import dataclass
+from flax import struct
+from flax.core import FrozenDict
+import math
+
+# import torch
+# import torch.nn.functional as F
+# from torch import nn
+
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+
+# from models.common import trunc_normal_init_
+trunc_normal_init_ = jax.nn.initializers.truncated_normal(stddev=1.0)
+from models.layers import rms_norm, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
+from models.sparse_embedding import CastedSparseEmbedding
+
+
+# @dataclass
+@struct.dataclass
+class InnerCarry:
+    z_H: jnp.ndarray
+    z_L: jnp.ndarray
+    
+
+@struct.dataclass
+class Carry:
+    inner_carry: InnerCarry
+    
+    steps: jnp.ndarray
+    halted: jnp.ndarray
+
+    current_data: FrozenDict[str, jnp.ndarray]
+
+class HRMBlock(nn.Module):
+    hidden_size: int
+    num_heads: int
+    expansion: float
+    rms_norm_eps: float
+    
+    @nn.compact
+    def __call__(self, cos_sin: CosSin, hidden_states: jnp.ndarray):
+        assert self.hidden_size % self.num_heads == 0, f"hidden size must be divisible by number of heads, got {self.hidden_size} and {self.num_heads}"
+        hidden_states = rms_norm(
+            hidden_states + Attention(
+                hidden_size=self.hidden_size,
+                head_dim=self.hidden_size // self.num_heads,
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_heads,
+                causal=False
+            )(cos_sin=cos_sin, hidden_states=hidden_states),
+            variance_epsilon=self.rms_norm_eps
+        )
+        hidden_states = rms_norm(
+            hidden_states + SwiGLU(
+                hidden_size=self.hidden_size,
+                expansion=self.expansion
+            )(hidden_states),
+            variance_epsilon=self.rms_norm_eps
+        )
+        return hidden_states
+
+
+class HRMReasoningModule(nn.Module):
+    layers: tuple[HRMBlock]
+
+    @nn.compact
+    def __call__(self, hidden_states: jnp.ndarray, input_injection: jnp.ndarray, cos_sin: CosSin):
+        # Input injection (add)
+        hidden_states = hidden_states + input_injection
+        # Layers
+        for layer in self.layers:
+            hidden_states = layer(cos_sin=cos_sin, hidden_states=hidden_states)
+
+        return hidden_states
+
+class HRM_ACTV1(nn.Module):
+    # dataset-related configs
+    batch_size: int
+    seq_len: int
+    vocab_size: int
+    num_puzzle_identifiers: int
+
+    # algo configs
+    H_cycles: int
+    L_cycles: int
+    halt_max_steps: int
+    halt_exploration_prob: float
+    
+    # model configs
+    H_layers: int
+    L_layers: int
+    
+    puzzle_emb_ndim: int = 0
+    hidden_size: int = 512
+    num_heads: int = 8
+    pos_encodings: str = 'rope' # 'rope' or 'learned'
+    expansion: float = 4.0
+    rms_norm_eps: float = 1e-5
+    rope_theta: float = 10000.0
+    forward_dtype: str = "bfloat16"
+
+    def setup(self):
+        self._forward_dtype = getattr(jnp, self.forward_dtype)
+
+        # I/O
+        self.embed_scale  = math.sqrt(self.hidden_size)
+        embed_init_std = 1.0 / self.embed_scale
+
+        self.embed_tokens = CastedEmbedding(self.vocab_size, self.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+        self.lm_head      = CastedLinear(self.hidden_size, self.vocab_size, bias=False)
+        
+        # NOTE: special init for q_head
+        self.q_head       = CastedLinear(self.hidden_size, 2, bias=True, initialization='-5')
+
+        self.puzzle_emb_len = -(self.puzzle_emb_ndim // -self.hidden_size)  # ceil div
+        if self.puzzle_emb_ndim > 0:
+            raise NotImplementedError('puzzle_emb_ndim > 0 means there are multiple types of puzzles. Skip for now.')
+            # Zero init puzzle embeddings
+            self.puzzle_emb = CastedSparseEmbedding(self.num_puzzle_identifiers, self.puzzle_emb_ndim,
+                                                    batch_size=self.batch_size, init_std=0, cast_to=self.forward_dtype)
+
+        # LM Blocks
+        if self.pos_encodings == "rope":
+            self.rotary_emb = RotaryEmbedding(dim=self.hidden_size // self.num_heads,
+                                              max_position_embeddings=self.seq_len + self.puzzle_emb_len,
+                                              base=self.rope_theta)
+        elif self.pos_encodings == "learned":
+            self.embed_pos = CastedEmbedding(self.seq_len + self.puzzle_emb_len, self.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+        else:
+            raise NotImplementedError()
+
+        # Reasoning Layers
+        self.H_level = HRMReasoningModule(layers=[HRMBlock(hidden_size=self.hidden_size, num_heads=self.num_heads, expansion=self.expansion, rms_norm_eps=self.rms_norm_eps) for _ in range(self.H_layers)])
+        self.L_level = HRMReasoningModule(layers=[HRMBlock(hidden_size=self.hidden_size, num_heads=self.num_heads, expansion=self.expansion, rms_norm_eps=self.rms_norm_eps) for _ in range(self.L_layers)])
+
+        # Initial states
+        # These states are not trainble, and also will NOT be updated
+        self.H_init = self.variable('const', 'H_init', trunc_normal_init_, self.make_rng('const'), (self.hidden_size,))
+        self.L_init = self.variable('const', 'L_init', trunc_normal_init_, self.make_rng('const'), (self.hidden_size,))
+
+        self.carry = self.variable('buffer', 'carry', lambda: None)
+
+    def _input_embeddings(self, input: jnp.ndarray, puzzle_identifiers: jnp.ndarray):
+        # Token embedding
+        embedding = self.embed_tokens(input.astype(jnp.int32))
+
+        # Puzzle embeddings
+        if self.puzzle_emb_ndim > 0:
+            raise NotImplementedError
+            puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
+            
+            pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
+            if pad_count > 0:
+                puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
+
+            embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding), dim=-2)
+
+        # Position embeddings
+        if self.pos_encodings == "learned":
+            # scale by 1/sqrt(2) to maintain forward variance
+            embedding = 0.707106781 * (embedding + self.embed_pos.embedding_weight.to(self.forward_dtype))
+
+        # Scale
+        return self.embed_scale * embedding
+
+    def _init_carry(self, batch_size):
+        self.carry.value = Carry(
+            inner_carry=InnerCarry(
+                z_H=jnp.empty((batch_size, self.seq_len + self.puzzle_emb_len, self.hidden_size), dtype=self.forward_dtype),
+                z_L=jnp.empty((batch_size, self.seq_len + self.puzzle_emb_len, self.hidden_size), dtype=self.forward_dtype),
+            ),
+            steps=jnp.zeros((batch_size, ), dtype=jnp.int32),
+            halted=jnp.ones((batch_size, ), dtype=jnp.bool_),  # Default to halted
+            current_data={}
+        )
+
+    def _update_carry(self):
+        """
+        "Update Carry" is reset the inner carry (z_H, z_L) when the outer carry indicates a reset (halted).
+        """
+        reset_flag = self.carry.value.halted
+        carry = self.carry.value
+        self.carry.value = InnerCarry(
+            z_H=jnp.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
+            z_L=jnp.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
+        )
+
+    def _inner_step(self, batch: FrozenDict[str, jnp.ndarray], update_inner_carry: bool):
+        cos_sin = self.rotary_emb() if self.pos_encodings == "rope" else None
+        carry = self.carry.value
+
+        # Input encoding
+        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+
+        # Forward iterations (NOTE{zhh}: main algorithm is here)
+        z_H, z_L = carry.z_H, carry.z_L
+
+        # TODO{zhh}: change to for-i-loop?
+        for _H_step in range(self.H_cycles):
+            for _L_step in range(self.L_cycles):
+                if not ((_H_step == self.H_cycles - 1) and (_L_step == self.config.L_cycles - 1)):
+                    z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin)
+
+            if not (_H_step == self.H_cycles - 1):
+                z_H = self.H_level(z_H, z_L, cos_sin=cos_sin)
+
+        z_H = jax.lax.stop_gradient(z_H)
+        z_L = jax.lax.stop_gradient(z_L)
+
+        # 1-step grad
+        z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin)
+        z_H = self.H_level(z_H, z_L, cos_sin=cos_sin)
+
+        # LM Outputs
+        new_carry = InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
+        
+        if update_inner_carry:
+            self.carry.value.inner_carry = new_carry # overwrite inner carry
+        
+        # New carry no grad
+        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
+
+        # Q head
+        q_logits = self.q_head(z_H[:, 0]).to(jnp.float32)
+        
+        return output, (q_logits[..., 0], q_logits[..., 1])
+
+    def __call__(self, batch: FrozenDict[str, jnp.ndarray], rng, train: bool):
+        batch_size = batch["inputs"].shape[0]
+        
+        # need to update carry each call
+        self._update_carry()
+        carry = self.carry.value
+        
+        new_steps = jnp.where(carry.halted, 0, carry.steps)
+        new_current_data = {k: jnp.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
+        
+        # Forward inner step
+        logits, (q_halt_logits, q_continue_logits) = self._inner_step(new_current_data, update_inner_carry=True)
+        
+        outputs = {
+            "logits": logits,
+            "q_halt_logits": q_halt_logits,
+            "q_continue_logits": q_continue_logits
+        }
+        
+        new_steps = new_steps + 1
+        is_last_step = new_steps >= self.halt_max_steps
+        halted = is_last_step
+
+        # TODO{zhh}: understand this ACT implementation
+        if train and (self.halt_max_steps > 1):
+            # Halt signal
+            # NOTE: During evaluation, always use max steps, this is to guarantee the same halting steps inside a batch for batching purposes
+            halted = halted | (q_halt_logits > q_continue_logits)
+
+            # Exploration
+            rng, _ = jax.random.split(rng)
+            rng1, rng2 = jax.random.split(rng)
+            min_halt_steps = (jax.random.uniform(rng1, q_halt_logits.shape) < self.halt_exploration_prob) * jax.random.randint(rng2, new_steps.shape, 2, self.halt_max_steps + 1)
+
+            halted = halted & (new_steps >= min_halt_steps)
+
+            # Compute target Q
+            # NOTE: No replay buffer and target networks for computing target Q-value.
+            # As batch_size is large, there're many parallel envs.
+            # Similar concept as PQN https://arxiv.org/abs/2407.04811
+            
+            # NOTE{zhh}: since this is only for RL, no update of carry
+            next_q_halt_logits, next_q_continue_logits = self._inner_step(new_current_data, update_inner_carry=False)[-1]
+
+            outputs["target_q_continue"] = jax.nn.sigmoid(jnp.where(is_last_step, next_q_halt_logits, jnp.maximum(next_q_halt_logits, next_q_continue_logits)))
+
+        self.carry.value.steps = new_steps
+        self.carry.value.halted = halted
+        self.carry.value.current_data = new_current_data
+        return outputs
+    
+    def init_fn(self, batch: FrozenDict[str, jnp.ndarray]):
+        self._init_carry(batch["inputs"].shape[0])
+        return self._inner_step(batch, update_inner_carry=False)[0]
+
+    def while_loop(self, batch: FrozenDict[str, jnp.ndarray]):
+        # during inference, rewrite the carry to null
+        self._init_carry(batch["inputs"].shape[0])
+        # call once
+        output = self(batch, None, train=False)
+
+        def cond_fun(module, output):
+            return module.carry.value.halted.all()
+        
+        def body_fun(module, output):
+            return self(batch, None, train=False)
+
+        out = nn.while_loop(cond_fun, body_fun, self, output, carry_variables='buffer')
+        
+        return out
+    
+if __name__ == "__main__":
+    # TODO{zhh}: perform model test here
+    pass
