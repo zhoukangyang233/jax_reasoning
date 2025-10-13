@@ -261,6 +261,11 @@ class HRM_ACTV1(nn.Module):
         new_steps = new_steps + 1
         is_last_step = new_steps >= self.halt_max_steps
         halted = is_last_step
+        self.carry.value = self.carry.value.replace(
+            steps=new_steps,
+            halted=halted,
+            current_data=new_current_data
+        )
 
         # TODO{zhh}: understand this ACT implementation
         if train and (self.halt_max_steps > 1):
@@ -285,11 +290,6 @@ class HRM_ACTV1(nn.Module):
 
             outputs["target_q_continue"] = jax.nn.sigmoid(jnp.where(is_last_step, next_q_halt_logits, jnp.maximum(next_q_halt_logits, next_q_continue_logits)))
 
-        self.carry.value = self.carry.value.replace(
-            steps=new_steps,
-            halted=halted,
-            current_data=new_current_data
-        )
         return outputs
     
     def init_fn(self, batch: FrozenDict[str, jnp.ndarray]):
