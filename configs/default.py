@@ -42,6 +42,7 @@ def get_config():
     wandb.notes = ''
     
     # pretrained model
+    config.just_evaluate = False
     config.load_from = ''
 
     return config

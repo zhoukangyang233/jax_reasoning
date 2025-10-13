@@ -126,8 +126,9 @@ def act_loss_and_metrics(buffer, outputs, loss_fn, train=True):
     metrics = {
         "valid_data_rate": (valid_data_num > 0).mean(axis=0),
         "valid_output_rate": valid_outputs.mean(axis=0),
-        "acc_per_token": valid_mean(valid_outputs, is_correct.mean(axis=1)),
-        "pass@1": valid_mean(valid_outputs, seq_is_correct),
+        "acc_per_token": is_correct.mean(axis=1).mean(axis=0), # just monitor ce
+        "pass@1": (valid_outputs & seq_is_correct).mean(axis=0), # this is the final acc
+        "valid_output_acc": valid_mean(valid_outputs, seq_is_correct),
         "q_halt_acc": valid_mean(valid_outputs, q_halt_acc),
         "inference_steps": valid_mean(valid_outputs, carry.steps),
 
@@ -237,11 +238,15 @@ def train_and_evaluate(config, workdir):
     
     # TODO{ZHH}: this is for debug. remove it afterwards
     # epoch_offset = -1
+    if config.just_evaluate:
+        log_for_0("Got config.just_evaluate=True. Just evaluate the model once and exit...")
+        epoch_offset = config.training.epochs - 1
+        train_dl = ()
 
     timer.reset()
     for epoch in range(epoch_offset, config.training.epochs):
         log_for_0(f"Epoch {epoch} ...")
-        train_metrics = MyMetrics()
+        train_metrics = MyMetrics(reduction='avg')
         for n_batch, batch in enumerate(train_dl):
             batch = input_pipeline.prepare_batch_data(batch, batch_size=device_batch_size, dataset_metdata=train_metadata)
             state, metrics, vis = p_train_step(state, batch)
@@ -256,7 +261,7 @@ def train_and_evaluate(config, workdir):
                     config.training.log_per_step / timer.elapse_with_reset()
                 )
                 summary.update({"ep": ep, "step": step})
-                logger.log(n_batch + 1, summary)
+                logger.log(step + 1, summary)
                 # for k, v in vis.items():
                 #     log_for_0(f'vis[{k}]: {(v.max(), v.min(), v.mean(), v.std())}') # DEBUG
                 #     if jnp.isnan(v).any():
@@ -270,7 +275,7 @@ def train_and_evaluate(config, workdir):
 
         # eval
         timer.reset()
-        if (epoch + 1) % config.training.eval_interval == 0:
+        if config.just_evaluate or (epoch + 1) % config.training.eval_interval == 0:
             log_for_0(f"Evaluating on epoch {epoch} ...")
             eval_metrics = MyMetrics(reduction='avg')
             for n_batch, batch in enumerate(eval_dl):
@@ -286,9 +291,12 @@ def train_and_evaluate(config, workdir):
             log_for_0(f"Epoch {epoch} eval done in {timer}.")
             
             # TODO: log visualizations
-            logger.log_image(step + 1, {f'data_{i}': sudoku_to_image(batch['labels'][0][i]) for i in range(4)})
-            logger.log_image(step + 1, {f'completion_{i}': sudoku_to_image(vis[0][i]) for i in range(4)})
+            logger.log_image(step + 1, {f'data_{i}': sudoku_to_image(batch['labels'][0][i], prompt=batch['inputs'][0][i]) for i in range(4)})
+            logger.log_image(step + 1, {f'completion_{i}': sudoku_to_image(vis[0][i], prompt=batch['inputs'][0][i]) for i in range(4)})
+            
+            if config.just_evaluate:
+                return
 
         # save checkpoint
-        if (epoch + 1) % config.training.checkpoint_interval == 0 or (epoch + 1) == config.training.num_epochs:
+        if (epoch + 1) % config.training.checkpoint_interval == 0 or (epoch + 1) == config.training.epochs:
             save_checkpoint(state, workdir)

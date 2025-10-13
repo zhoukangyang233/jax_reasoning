@@ -1,10 +1,12 @@
 training:
     batch_size: 768
     eval_batch_size: 768
-    epochs: 100000
-    log_per_step: 100
-    eval_interval: 1000
-    checkpoint_interval: 1000
+    epochs: 100
+    log_per_step: 400
+    eval_interval: 10
+    checkpoint_interval: 10
+
+    optimizer: adam_atan2
 
 model:
     name: HRM_default
