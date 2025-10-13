@@ -20,6 +20,7 @@ import re
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
 from absl import logging
+import jax
 from flax import traverse_util
 
 
@@ -251,6 +252,8 @@ def str_set(state_set):
 
 # Function to print number of parameters
 def print_params(params):
+    if jax.process_index() != 0:
+        return
     params_flatten = flatten_state_dict(params)
 
     total_params = 0

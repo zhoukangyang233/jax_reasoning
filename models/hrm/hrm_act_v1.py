@@ -78,6 +78,38 @@ class HRMReasoningModule(nn.Module):
 
         return hidden_states
 
+def i_chain(*funcs, common_args=2):
+    def chained_func(*args):
+        *common, x = args
+        assert len(common) == common_args, f'Expected {common_args} common args, got {len(common)}'
+        for f in funcs:
+            x = f(*common, x)
+        return x
+    return chained_func
+
+def nn_for_i_loop(lower, upper, body_fun, module, init_val):
+    # lower: int
+    # upper: int
+    # body_fun: (module, i, val) -> val
+    # init_val: any
+
+    # This is not runable due to bad versions
+    # def fn(m, carry, x):
+    #     return carry, body_fun(m, x, carry)
+    # i_arr = jnp.arange(lower, upper)
+    # scan_fn = nn.scan(fn, variable_broadcast='params', split_rngs={'params': False}, in_axes=0, out_axes=0, length=upper - lower)
+    # _, out = scan_fn(module, init_val, i_arr)
+    # return jax.tree_map(lambda x: x[-1], out)
+    
+    # ZHH: use while loop to implement for-i-loop
+    def cond_fun(module, val):
+        return val[0] < upper
+    def body_fun_wrap(module, val):
+        i, val = val
+        return i + 1, body_fun(module, i, val)
+    _, out = nn.while_loop(cond_fun, body_fun_wrap, module, (lower, init_val))#, broadcast_variables='params')
+    return out
+
 class HRM_ACTV1(nn.Module):
     # dataset-related configs
     batch_size: int = None
@@ -215,14 +247,44 @@ class HRM_ACTV1(nn.Module):
         # Forward iterations (NOTE{zhh}: main algorithm is here)
         z_H, z_L = carry.z_H, carry.z_L
 
-        # TODO{zhh}: change to for-i-loop?
-        for _H_step in range(self.H_cycles):
-            for _L_step in range(self.L_cycles):
-                if not ((_H_step == self.H_cycles - 1) and (_L_step == self.L_cycles - 1)):
-                    z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin)
+        # for _H_step in range(self.H_cycles):
+        #     for _L_step in range(self.L_cycles):
+        #         if not ((_H_step == self.H_cycles - 1) and (_L_step == self.L_cycles - 1)):
+        #             z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin)
 
-            if not (_H_step == self.H_cycles - 1):
-                z_H = self.H_level(z_H, z_L, cos_sin=cos_sin)
+        #     if not (_H_step == self.H_cycles - 1):
+        #         z_H = self.H_level(z_H, z_L, cos_sin=cos_sin)
+        
+        # change to for-i-loop?
+        z_H, z_L = nn_for_i_loop(
+            0, self.H_cycles * self.L_cycles,
+            i_chain(
+                # val: (z_H, z_L)
+                lambda m, i, val: ( # update L
+                    val[0],
+                    nn.cond(
+                        i == self.H_cycles * self.L_cycles - 1,
+                        lambda mo, z_L: mo.L_level(z_L, val[0] + input_embeddings, cos_sin=cos_sin),
+                        lambda mo, z_L: z_L,
+                        m,
+                        val[1]
+                    )
+                ),
+                lambda m, i, val: (
+                    nn.cond(
+                        ((i + 1) % self.L_cycles == 0) & (i != self.H_cycles * self.L_cycles - 1),
+                        lambda mo, z_H: mo.H_level(z_H, val[1], cos_sin=cos_sin),
+                        lambda mo, z_H: z_H,
+                        m,
+                        val[0]
+                    ),
+                    val[1]
+                ),
+                common_args=2
+            ),
+            self,
+            (z_H, z_L)
+        )
 
         z_H = SG(z_H)
         z_L = SG(z_L)
@@ -267,11 +329,6 @@ class HRM_ACTV1(nn.Module):
         new_steps = new_steps + 1
         is_last_step = new_steps >= self.halt_max_steps
         halted = is_last_step
-        self.carry.value = self.carry.value.replace(
-            steps=new_steps,
-            halted=halted,
-            current_data=new_current_data
-        )
 
         # TODO{zhh}: understand this ACT implementation
         if train and (self.halt_max_steps > 1):
@@ -296,12 +353,25 @@ class HRM_ACTV1(nn.Module):
 
             outputs["target_q_continue"] = jax.nn.sigmoid(jnp.where(is_last_step, next_q_halt_logits, jnp.maximum(next_q_halt_logits, next_q_continue_logits)))
 
+        self.carry.value = self.carry.value.replace(
+            steps=new_steps,
+            halted=halted,
+            current_data=new_current_data
+        )
         return outputs
     
     def init_fn(self, batch: FrozenDict[str, jnp.ndarray]):
         self._init_carry(batch["inputs"].shape[0])
         self._update_carry() # Use this, otherwise H_init will not be inited
-        ret = self._inner_step(batch, update_inner_carry=False)
+        
+        # ret = self._inner_step(batch, update_inner_carry=False)
+        # should not loop when init
+        cos_sin = self.rotary_emb() if self.pos_encodings == "rope" else None
+        emb = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+        r = self.H_level(self.carry.value.inner_carry.z_H, self.carry.value.inner_carry.z_L, cos_sin=cos_sin)
+        r = self.L_level(self.carry.value.inner_carry.z_L, r + emb, cos_sin=cos_sin)
+        ret = self.lm_head(r), self.q_head(r[:, 0])
+        
         # hack: let init have no carry
         self._init_carry(self.batch_size)
         return ret
@@ -310,11 +380,11 @@ class HRM_ACTV1(nn.Module):
     def inference(self, batch: FrozenDict[str, jnp.ndarray]):
         # during inference, rewrite the carry to null
         self._init_carry(batch["inputs"].shape[0])
-        # call once
+        # call once for shape
         output = self(batch, None, train=False)
 
         def cond_fun(module, output):
-            return module.carry.value.halted.all()
+            return ~module.carry.value.halted.all()
         
         def body_fun(module, output):
             return module(batch, None, train=False)
