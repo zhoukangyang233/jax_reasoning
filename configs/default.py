@@ -5,7 +5,7 @@ def get_config():
     config = ml_collections.ConfigDict()
     
     config.dataset = dataset = ml_collections.ConfigDict()
-    dataset.name = "imagenet"
+    dataset.dataset_cls = "sudoku"
     dataset.dataset_path = "/kmh-nfs-ssd-us-mount/data/sudoku-extreme-full"
     
     dataset.seq_len = 81
@@ -39,7 +39,7 @@ def get_config():
 
     config.wandb = wandb = ml_collections.ConfigDict()
     wandb.on_use = True
-    wandb.wandb_notes = ''
+    wandb.notes = ''
     
     # pretrained model
     config.load_from = ''

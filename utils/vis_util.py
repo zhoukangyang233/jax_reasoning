@@ -6,7 +6,7 @@ from PIL import Image
 import io
 
 def sudoku_to_image(sudoku: jnp.ndarray, prompt: jnp.ndarray = None) -> Image:
-    assert sudoku.shape == (81,) and sudoku.dtype == jnp.int32
+    assert sudoku.shape == (81,) and sudoku.dtype == jnp.int32, (sudoku.shape, sudoku.dtype)
     sudoku = jax.device_get(sudoku).reshape(9, 9) - 1
     if prompt is not None:
         prompt = jax.device_get(prompt).reshape(9, 9) - 1

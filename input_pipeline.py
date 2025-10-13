@@ -59,12 +59,13 @@ class PuzzleDataset(Dataset):
                 for field_name, mmap_mode in self.FIELD_MMAP_MODES.items()
             }
         log_for_0(f'Dataset loaded.')
-            
-        assert len(self) == self.metadata.total_groups, f"Dataset size {len(self)} does not match metadata {self.metadata.total_groups}."
+
+        if len(self) != self.metadata.total_groups:
+            log_for_0(f"\033[31mWARNING: Dataset size {len(self)} does not match metadata {self.metadata.total_groups}.\033[0m")
             
     def __getitem__(self, index):
         t = self._data['inputs'][index], self._data['labels'][index], np.array(self._data['puzzle_identifiers'][index])
-        return tuple(torch.from_numpy(x.astype('int')) for x in t)
+        return tuple(torch.from_numpy(x.astype('int32')) for x in t)
 
     def __len__(self):
         return len(self._data['inputs'])
@@ -113,10 +114,10 @@ def create_split(
       steps_per_epoch: Number of steps to loop through the DataLoader.
     """
     rank = jax.process_index()
-    dataset_cls = DATASET_CONFIG_TO_CLS.get(dataset_cfg.dataset_cls, exec('raise ValueError(f"Unknown dataset class {dataset_cfg.dataset_cls}."))'))
+    dataset_cls = DATASET_CONFIG_TO_CLS.get(dataset_cfg.dataset_cls, lambda *args, **kwargs: exec('raise ValueError(f"Unknown dataset class {dataset_cfg.dataset_cls}.")'))
     if split == 'train':
         ds = dataset_cls(config=dataset_cfg, split=split)
-        log_for_0(ds)
+        log_for_0(f'\n{ds}')
         sampler = torch.utils.data.distributed.DistributedSampler(
             ds,
             num_replicas=jax.process_count(),
@@ -163,7 +164,7 @@ def create_split(
     else:
         raise ValueError(f"Unknown split {split}.")
     log_for_all(f'Dataset is loaded')
-    return it, steps_per_epoch
+    return it, steps_per_epoch, ds.metadata
 
 
 #### DataLoader ####
@@ -182,6 +183,7 @@ def prepare_batch_data(batch, batch_size=None, dataset_metdata=None):
     if metadata.ignore_label_id is not None:
         labels[labels == metadata.ignore_label_id] = IGNORE_LABEL_ID
     
+    batch = {"inputs": inputs, "labels": labels, "puzzle_identifiers": puzzle_identifiers}
     # pad the batch if smaller than batch_size
     if batch_size is not None and batch_size > puzzle_identifiers.shape[0]:
         pad_values = {
@@ -190,12 +192,10 @@ def prepare_batch_data(batch, batch_size=None, dataset_metdata=None):
             "puzzle_identifiers": metadata.blank_identifier_id
         }
         pad_size = batch_size - puzzle_identifiers.shape[0]
-        batch = {"inputs": inputs, "labels": labels, "puzzle_identifiers": puzzle_identifiers}
         batch = {k: torch.cat([v, torch.full((pad_size, ) + v.shape[1:], pad_values[k], dtype=v.dtype)], dim=0) for k, v in batch.items()}
 
     LDC = jax.local_device_count()
-    image = image.permute(0, 2, 3, 1)
-    return {k: v.reshape((LDC, -1) + v.shape[1:]) for k, v in batch.items()}
+    return {k: (v.reshape((LDC, -1) + v.shape[1:])).numpy() for k, v in batch.items()}
 
 ##### Augmentations #####
 

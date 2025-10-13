@@ -2,7 +2,9 @@ import jax
 import logging as sys_logging
 from absl import logging
 import wandb
-
+import numpy as np
+import os
+from PIL import Image
 
 def log_for_0(*args, logging_fn=logging.info, additional_judge=True, **kwargs):
     if jax.process_index() == 0 and additional_judge:
@@ -40,9 +42,10 @@ def supress_checkpt_info():
 
 class GoodLogger:
 
-    def __init__(self, use_wandb=False):
+    def __init__(self, workdir, use_wandb=False):
         if jax.process_index() != 0:
             return
+        self.workdir = workdir
         self.use_wandb = use_wandb
         if use_wandb and wandb.run is None:
             raise RuntimeError(
@@ -60,6 +63,35 @@ class GoodLogger:
         logging.info(log_str)
         if self.use_wandb:
             wandb.log(dict_obj, step=step)
+    
+    def log_image(self, step, image_dict):
+        if jax.process_index() != 0:
+            return
+
+        def reduce_arr_func(v):
+            if isinstance(v, Image.Image):
+                return v
+            assert isinstance(v, np.ndarray), "Invalid image type {}".format(type(v))
+            assert v.dtype == np.uint8, "Invalid image dtype {}".format(v.dtype)
+            assert (
+                v.ndim == 3
+                and 3 in [v.shape[0], v.shape[2]]
+            ), "Invalid image shape {}".format(v.shape)
+            if v.shape[0] == 3:
+                v = v.transpose((1, 2, 0))
+            return Image.fromarray(v)
+
+        if self.use_wandb:
+            wandb.log({
+                k: wandb.Image(reduce_arr_func(v)) for k, v in image_dict.items()
+            }, step=step)
+        else:
+            log_for_0(f"Saving images locally, at step {step}")
+            for k, v in image_dict.items():
+                v = reduce_arr_func(v)
+                os.makedirs(os.path.join(self.workdir, 'zhh_images'), exist_ok=True)
+                v.save(os.path.join(self.workdir, 'zhh_images', f"step{step:06d}_{k}.png"))
+
 
     # destructor
     def __del__(self):

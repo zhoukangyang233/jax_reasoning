@@ -28,9 +28,9 @@ from absl import logging
 from ml_collections import config_flags
 
 import train
-from utils import logging_utils
+from utils import logging_util
 
-logging_utils.supress_checkpt_info()
+logging_util.supress_checkpt_info()
 
 import warnings
 

@@ -1,0 +1,16 @@
+dataset:
+    dataset_path: ./fake_data
+
+training:
+    batch_size: 4
+    eval_batch_size: 4
+    epochs: 2
+    log_per_step: 100
+    eval_interval: 1
+    checkpoint_interval: 1
+
+model:
+    name: HRM_debug
+
+wandb:
+    on_use: False

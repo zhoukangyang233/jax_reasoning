@@ -13,7 +13,8 @@ from utils.logging_util import log_for_0, GoodLogger
 from utils.metric_utils import Timer, MyMetrics
 from utils.info_utils import print_params
 from utils.ckpt_utils import save_checkpoint, restore_checkpoint
-import models
+from utils.vis_util import sudoku_to_image
+import models.models_all
 import input_pipeline
 import optimizers
 from input_pipeline import IGNORE_LABEL_ID
@@ -23,17 +24,16 @@ PCI = jax.process_index()
 PCC = jax.process_count()
 LDC = jax.local_device_count()
 
+@struct.dataclass
 class MutableTrainState(train_state.TrainState):
     buffers: dict
     consts: dict
-    lr_fn: struct.field(pytree_node=False)
-    model: struct.field(pytree_node=False)
 
 
 # train state creation
-def create_train_state(rng, config, total_steps):
-    model_cls = getattr(models, config.model.name)
-    model = model_cls(**{k: v for k, v in config.model.to_dict().items() if k != "name"}, **{'seq_len': config.dataset.seq_len, 'vocab_size': config.dataset.vocab_size, 'num_puzzle_identifiers': config.dataset.num_puzzle_identifiers})
+def create_train_state(rng, config, total_steps, batch_size):
+    model_cls = getattr(models.models_all, config.model.name)
+    model = model_cls(**{k: v for k, v in config.model.to_dict().items() if k != "name"}, **{'seq_len': config.dataset.seq_len, 'vocab_size': config.dataset.vocab_size, 'num_puzzle_identifiers': config.dataset.num_puzzle_identifiers, 'batch_size': batch_size})
     fake_batch_shape = {
         'inputs': (2, config.dataset.seq_len),
         'labels': (2, config.dataset.seq_len),
@@ -43,7 +43,9 @@ def create_train_state(rng, config, total_steps):
     
     rng, init_rng = jax.random.split(rng)
     params_init_rng, const_init_rng = jax.random.split(init_rng, 2)
-    model_variables = jax.jit(partial(model.init, method=model.init_fn))(fake_batch, rngs={'params': params_init_rng, 'const': const_init_rng})
+    model_variables = jax.jit(partial(model.init, method=model.init_fn))({'params': params_init_rng, 'const': const_init_rng}, fake_batch)
+    
+    print_params(model_variables['params'])
 
     tx, lr_fn = optimizers.build_optimizer(config.training, total_steps)
     
@@ -53,8 +55,6 @@ def create_train_state(rng, config, total_steps):
         consts=model_variables['const'],
         tx=tx,
         apply_fn=model.apply,
-        lr_fn=lr_fn,
-        model=model,
     )
 
     return model, state, lr_fn
@@ -89,7 +89,7 @@ LOSS_FUNCTIONS = {
 def valid_mean(validity, arr):
     assert validity.shape == arr.shape, f"validity.shape: {validity.shape}, arr.shape: {arr.shape}"
     arr = arr.astype(jnp.float32)
-    return jnp.where(validity, arr, 0).sum(axis=0) / jnp.maximum(jnp.sum(validity, axis=0), 1)
+    return jnp.where(validity, arr, 0*arr).sum(axis=0) / jnp.maximum(jnp.sum(validity, axis=0), 1)
 
 def act_loss_and_metrics(buffer, outputs, loss_fn, train=True):
     # TODO{zhh}: verify correctness, especially data validity
@@ -98,6 +98,9 @@ def act_loss_and_metrics(buffer, outputs, loss_fn, train=True):
 
     carry = buffer['carry']
     labels = carry.current_data["labels"]
+
+    assert labels.shape == (B, L), f"labels.shape: {labels.shape}, B: {B}, L: {L}"
+
     mask = (labels != IGNORE_LABEL_ID) # [B, SeqLen]
 
     # acc
@@ -111,11 +114,11 @@ def act_loss_and_metrics(buffer, outputs, loss_fn, train=True):
     ce_loss = loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID)
     assert ce_loss.shape == (B, L), f"ce_loss.shape: {ce_loss.shape}, B: {B}, L: {L}"
     ce_loss = (ce_loss / jnp.maximum(jnp.sum(mask, axis=-1, keepdims=True), 1)).sum(axis=-1).mean(axis=0) # [B,]
-    q_halt_loss = optax.sigmoid_binary_cross_entropy(outputs['q_halt_logits'], seq_is_correct).sum(axis=1).mean(axis=0) # [B,]
+    q_halt_loss = optax.sigmoid_binary_cross_entropy(outputs['q_halt_logits'], seq_is_correct).mean(axis=0) # [B,]
 
-    q_continue_loss = 0
+    q_continue_loss = q_halt_loss*0
     if train:
-        q_continue_loss = optax.sigmoid_binary_cross_entropy(outputs['target_q_continue'], outputs['q_continue_logits']).sum(axis=1).mean(axis=0)
+        q_continue_loss = optax.sigmoid_binary_cross_entropy(outputs['target_q_continue'], outputs['q_continue_logits']).mean(axis=0)
         
     loss = ce_loss + (q_halt_loss + q_continue_loss) * 0.5
     
@@ -137,7 +140,7 @@ def act_loss_and_metrics(buffer, outputs, loss_fn, train=True):
     assert all([v.shape == () for v in metrics.values()]), f"metrics: {dict((k, v.shape) for k, v in metrics.items())}"
     assert all(v.shape == () for v in [loss, ce_loss, q_halt_loss, q_continue_loss]), f"loss: {loss.shape}, ce_loss: {ce_loss.shape}, q_halt_loss: {q_halt_loss.shape}, q_continue_loss: {q_continue_loss.shape}"
     
-    return loss, metrics
+    return loss, metrics, outputs['logits'].argmax(axis=-1).astype(jnp.int32)
 
 def compute_metrics(dict_losses):
     metrics = dict_losses.copy()
@@ -145,26 +148,26 @@ def compute_metrics(dict_losses):
     metrics = jax.tree_map(lambda x: x.flatten(), metrics)  # (batch_size,)
     return metrics
 
-def train_step(state: MutableTrainState, batch, loss_fn, init_rng):
-    rng_step = jax.random.fold_in(jax.random.PRNGKey(0), state.step)
+def train_step(state: MutableTrainState, batch, loss_fn, init_rng, model, lr_fn):
+    rng_step = jax.random.fold_in(init_rng, state.step)
     def L(params):
-        variables = {'params': params, 'buffers': state.buffers}
-        out, new_model_state = state.apply_fn(variables, batch, mutable=['buffer'], train=True)
-        loss, metrics = act_loss_and_metrics(new_model_state['buffer'], out, loss_fn, train=True)
-        return loss, (metrics, new_model_state['buffer'])
+        variables = {'params': params, 'buffer': state.buffers, 'const': state.consts}
+        out, new_model_state = state.apply_fn(variables, batch, rng=rng_step, train=True, mutable=['buffer'])
+        loss, metrics, vis = act_loss_and_metrics(new_model_state['buffer'], out, loss_fn, train=True)
+        return loss, (metrics, vis, new_model_state['buffer'])
     grad_fn = jax.value_and_grad(L, has_aux=True)
-    (loss, (metrics, new_buffers)), grads = grad_fn(state.params)
+    (loss, (metrics, vis, new_buffers)), grads = grad_fn(state.params)
     grads = jax.lax.pmean(grads, axis_name='batch')
     new_state = state.apply_gradients(grads=grads, buffers=new_buffers)
-    metrics['learning_rate'] = state.lr_fn(state.step)
-    
-    return new_state, compute_metrics(metrics)
+    metrics['learning_rate'] = lr_fn(state.step)
 
-def eval_step(state: MutableTrainState, batch, loss_fn):
-    variables = {'params': state.params, 'buffers': state.buffers}
-    out, _ = state.model.apply(variables, batch, mutable=['buffer'], method=state.model.inference)
-    _, metrics = act_loss_and_metrics(state.buffers, out, loss_fn, train=False)
-    return compute_metrics(metrics)
+    return new_state, compute_metrics(metrics), vis
+
+def eval_step(state: MutableTrainState, batch, loss_fn, model):
+    variables = {'params': state.params, 'buffer': state.buffers, 'const': state.consts}
+    out, new_state = model.apply(variables, batch, mutable=['buffer'], method=model.inference)
+    _, metrics, vis = act_loss_and_metrics(new_state['buffer'], out, loss_fn, train=False)
+    return compute_metrics(metrics), vis
 
 def wandb_init(config, workdir):
     if jax.process_index() == 0 and config.wandb.on_use:
@@ -180,7 +183,7 @@ def wandb_init(config, workdir):
         wandb.config.update({"ka": ka})
 
 def train_and_evaluate(config, workdir):
-    log_for_0(config)
+    log_for_0('\n' + str(config))
     rng = jax.random.key(config.training.seed)
     log_for_0(f"JAX process index: {PCI} started with local devices {jax.local_devices()}")
     
@@ -193,17 +196,18 @@ def train_and_evaluate(config, workdir):
     device_eval_batch_size = global_eval_batch_size // PCC
     assert global_batch_size % (PCC) == 0 and device_batch_size % LDC == 0, f"global_batch_size: {global_batch_size}, PCC: {PCC}, LDC: {LDC}, local_batch_size: {device_batch_size}"
     assert global_eval_batch_size % (PCC) == 0 and device_eval_batch_size % LDC == 0, f"global_eval_batch_size: {global_eval_batch_size}, PCC: {PCC}, LDC: {LDC}, local_eval_batch_size: {device_eval_batch_size}"
-    train_dl, train_steps_per_epoch = input_pipeline.create_split(dataset_cfg, split='train', batch_size=device_batch_size)
-    eval_dl, eval_steps_per_epoch = input_pipeline.create_dataloader(dataset_cfg, split='test', batch_size=device_eval_batch_size)
+    train_dl, train_steps_per_epoch, train_metadata = input_pipeline.create_split(dataset_cfg, split='train', batch_size=device_batch_size)
+    eval_dl, eval_steps_per_epoch, eval_metadata = input_pipeline.create_split(dataset_cfg, split='test', batch_size=device_eval_batch_size)
     log_for_0(f"train_steps_per_epoch: {train_steps_per_epoch}, eval_steps_per_epoch: {eval_steps_per_epoch}")
     total_steps = config.training.epochs * train_steps_per_epoch
     
     # init model
     rng, init_rng = jax.random.split(rng)
-    state = create_train_state(init_rng, config, total_steps)
+    model, state, lr_fn = create_train_state(init_rng, config, total_steps, device_batch_size // LDC)
     del init_rng
     
     # restore checkpoint if any
+    epoch_offset = 0
     if config.load_from:
         state = restore_checkpoint(state, config.load_from)
         epoch_offset = int(state.step) // train_steps_per_epoch
@@ -214,22 +218,31 @@ def train_and_evaluate(config, workdir):
     # compile train_step, eval_step
     loss_fn = LOSS_FUNCTIONS[config.training.loss_fn]
     rng, train_rng = jax.random.split(rng)
-    p_train_step = jax.pmap(partial(train_step, loss_fn=loss_fn, init_rng=train_rng), axis_name='batch', donate_argnums=(0,))
-    p_eval_step = jax.pmap(partial(eval_step, loss_fn=loss_fn), axis_name='batch')
+    p_train_step = jax.pmap(partial(train_step, loss_fn=loss_fn, init_rng=train_rng, model=model, lr_fn=lr_fn), axis_name='batch', donate_argnums=(0,))
+    p_eval_step = jax.pmap(partial(eval_step, loss_fn=loss_fn, model=model), axis_name='batch')
+    test_batch = input_pipeline.prepare_batch_data(next(iter(train_dl)), batch_size=device_batch_size, dataset_metdata=train_metadata)
+    log_for_0("Compiling p_train_step and p_eval_step ...")
+    timer = Timer()
+    p_train_step = p_train_step.lower(state, test_batch).compile()
+    p_eval_step = p_eval_step.lower(state, test_batch).compile()
+    log_for_0(f"p_train_step and p_eval_step compiled in {timer}.")
 
     # wandb init
     wandb_init(config, workdir)
-    logger = GoodLogger(use_wandb=config.wandb.on_use)
+    logger = GoodLogger(workdir, use_wandb=config.wandb.on_use)
     
     # training loop
-    timer = Timer()
-    for epoch in range(epoch_offset, config.training.num_epochs):
+    
+    # TODO{ZHH}: this is for debug. remove it afterwards
+    # epoch_offset = -1
+
+    timer.reset()
+    for epoch in range(epoch_offset, config.training.epochs):
         log_for_0(f"Epoch {epoch} ...")
         train_metrics = MyMetrics()
         for n_batch, batch in enumerate(train_dl):
-            batch = input_pipeline.prepare_batch_data(batch, batch_size=device_batch_size, dataset_metdata=dataset_cfg)
-            batch = {k: jnp.asarray(v) for k, v in batch.items()}
-            state, metrics = p_train_step(state, batch)
+            batch = input_pipeline.prepare_batch_data(batch, batch_size=device_batch_size, dataset_metdata=train_metadata)
+            state, metrics, vis = p_train_step(state, batch)
             train_metrics.update(metrics)
             step = epoch * train_steps_per_epoch + n_batch
             ep = epoch + n_batch / train_steps_per_epoch
@@ -242,6 +255,9 @@ def train_and_evaluate(config, workdir):
                 )
                 summary.update({"ep": ep, "step": step})
                 logger.log(n_batch + 1, summary)
+                # log_for_0(f'vis: {vis}') # DEBUG
+                if epoch == -1: # means debug run
+                    break
 
         # eval
         timer.reset()
@@ -249,16 +265,21 @@ def train_and_evaluate(config, workdir):
             log_for_0(f"Evaluating on epoch {epoch} ...")
             eval_metrics = MyMetrics(reduction='avg')
             for n_batch, batch in enumerate(eval_dl):
-                batch = input_pipeline.prepare_batch_data(batch, batch_size=device_batch_size, dataset_metdata=dataset_cfg)
-                batch = {k: jnp.asarray(v) for k, v in batch.items()}
-                metrics = p_eval_step(state, batch)
+                batch = input_pipeline.prepare_batch_data(batch, batch_size=device_batch_size, dataset_metdata=eval_metadata)
+                metrics, vis = p_eval_step(state, batch)
                 eval_metrics.update(metrics)
+                if epoch == -1: # means debug run
+                    break
             log_for_0(f"Epoch {epoch} evaluation done. " + ", ".join([f"{k}: {v:.4f}" for k, v in eval_metrics.compute().items()]))
             summary = eval_metrics.compute()
             summary = {f"eval/{k}": v for k, v in summary.items()}
-            logger.log(n_batch + 1, summary)
+            logger.log(step + 1, summary)
             log_for_0(f"Epoch {epoch} eval done in {timer}.")
+            
+            # TODO: log visualizations
+            logger.log_image(step + 1, {f'data_{i}': sudoku_to_image(batch['labels'][0][i]) for i in range(4)})
+            logger.log_image(step + 1, {f'completion_{i}': sudoku_to_image(vis[0][i]) for i in range(4)})
 
         # save checkpoint
         if (epoch + 1) % config.training.checkpoint_interval == 0 or (epoch + 1) == config.training.num_epochs:
-            save_checkpoint(state, workdir, epoch=epoch + 1)
+            save_checkpoint(state, workdir)

@@ -80,20 +80,20 @@ class HRMReasoningModule(nn.Module):
 
 class HRM_ACTV1(nn.Module):
     # dataset-related configs
-    batch_size: int
-    seq_len: int
-    vocab_size: int
-    num_puzzle_identifiers: int
+    batch_size: int = None
+    seq_len: int = None
+    vocab_size: int = None
+    num_puzzle_identifiers: int = None
 
     # algo configs
-    H_cycles: int
-    L_cycles: int
-    halt_max_steps: int
-    halt_exploration_prob: float
-    
+    H_cycles: int = None
+    L_cycles: int = None
+    halt_max_steps: int = None
+    halt_exploration_prob: float = None
+
     # model configs
-    H_layers: int
-    L_layers: int
+    H_layers: int = None
+    L_layers: int = None
     
     puzzle_emb_ndim: int = 0
     hidden_size: int = 512
@@ -102,7 +102,8 @@ class HRM_ACTV1(nn.Module):
     expansion: float = 4.0
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
-    forward_dtype: str = "bfloat16"
+    forward_dtype: str = "float32"
+    # forward_dtype: str = "bfloat16"
 
     def setup(self):
         self._forward_dtype = getattr(jnp, self.forward_dtype)
@@ -176,7 +177,11 @@ class HRM_ACTV1(nn.Module):
             ),
             steps=jnp.zeros((batch_size, ), dtype=jnp.int32),
             halted=jnp.ones((batch_size, ), dtype=jnp.bool_),  # Default to halted
-            current_data={"inputs": 0, "labels": 0, "puzzle_identifiers": 0}
+            current_data={
+                "inputs": jnp.zeros((batch_size, self.seq_len), dtype=jnp.int32),
+                "labels": jnp.zeros((batch_size, self.seq_len), dtype=jnp.int32),
+                "puzzle_identifiers": jnp.zeros((batch_size,), dtype=jnp.int32)
+            }
         )
 
     def _update_carry(self):
@@ -242,7 +247,7 @@ class HRM_ACTV1(nn.Module):
         carry = self.carry.value
         
         new_steps = jnp.where(carry.halted, 0, carry.steps)
-        new_current_data = {k: jnp.where(carry.halted.reshape((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
+        new_current_data = {k: jnp.where(carry.halted.reshape((batch_size, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
         
         # Forward inner step
         logits, (q_halt_logits, q_continue_logits) = self._inner_step(new_current_data, update_inner_carry=True)
@@ -290,7 +295,11 @@ class HRM_ACTV1(nn.Module):
     def init_fn(self, batch: FrozenDict[str, jnp.ndarray]):
         self._init_carry(batch["inputs"].shape[0])
         self._update_carry() # Use this, otherwise H_init will not be inited
-        return self._inner_step(batch, update_inner_carry=False)[0]
+        ret = self._inner_step(batch, update_inner_carry=False)
+        # hack: let init have no carry
+        self._init_carry(self.batch_size)
+        return ret
+        
 
     def inference(self, batch: FrozenDict[str, jnp.ndarray]):
         # during inference, rewrite the carry to null
@@ -316,13 +325,16 @@ if __name__ == "__main__":
     identifiers = jnp.zeros((7,), dtype=jnp.int32)
     batch = {"inputs": inputs, "labels": labels, "puzzle_identifiers": identifiers}
     model = HRM_debug(batch_size=7, seq_len=81, vocab_size=11, num_puzzle_identifiers=1)
-    # model = Foo()
-    variables = model.init({'params': jax.random.PRNGKey(0), 'const': jax.random.PRNGKey(0)}, batch, method=model.init_fn,)# mutable=['buffer', 'const'])
+    
+    # init: simulate the correct init (which use 2 bs)
+    variables = model.init({'params': jax.random.PRNGKey(0), 'const': jax.random.PRNGKey(0)}, jax.tree_map(lambda a: a[:2], batch), method=model.init_fn,)# mutable=['buffer', 'const'])
     print('init passed')
+    
     print('variables:', variables.keys())
     print('buffer:', variables['buffer'])
     output, new_variables = model.apply(variables, batch, rng=jax.random.PRNGKey(0), train=True, mutable=['buffer'])
     print('shape test passed')
+    
     output, new_variables = model.apply(variables, batch, mutable=['buffer'], method=model.inference)
     print('inference test passed')
 
