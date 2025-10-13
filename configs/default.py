@@ -30,7 +30,7 @@ def get_config():
     training.checkpoint_interval = 10_000
     training.loss_fn = 'stablemax_cross_entropy'
     
-    training.optimizer = 'adamw'  # adamw, AdamATan2
+    training.optimizer = 'adam_atan2'  # adamw, adam_atan2
     training.learning_rate = 1e-4
     training.lr_schedule = 'cos'
     training.lr_min_ratio = 1.0
