@@ -18,13 +18,14 @@ class CastedSparseEmbedding(nn.Module):
     batch_size: int
     
     def setup(self):
-        raise NotImplementedError('This has not been tested')
+        raise NotImplementedError
         self.weights = self.param(
             "weights",
             nn.initializers.truncated_normal(stddev=self.init_std),
+            (self.num_embeddings, self.embedding_dim)
         )
-        self.local_weights = self.variable("buffers", "local_weights", nn.zeros)
-        self.local_ids = self.variable("buffers", "local_ids", partial(nn.zeros, dtype=jnp.int32))
+        self.local_weights = self.variable("buffer", "local_weights", nn.zeros)
+        self.local_ids = self.variable("buffer", "local_ids", partial(nn.zeros, dtype=jnp.int32))
 
     def __call__(self, inputs: jnp.ndarray, train: bool) -> jnp.ndarray:
         if not train:

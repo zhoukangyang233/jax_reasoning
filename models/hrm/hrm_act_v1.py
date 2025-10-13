@@ -95,8 +95,8 @@ class HRM_ACTV1(nn.Module):
     H_layers: int = None
     L_layers: int = None
     
-    puzzle_emb_ndim: int = 0
     hidden_size: int = 512
+    puzzle_emb_ndim: int = 512
     num_heads: int = 8
     pos_encodings: str = 'rope' # 'rope' or 'learned'
     expansion: float = 4.0
@@ -119,11 +119,14 @@ class HRM_ACTV1(nn.Module):
         self.q_head       = CastedLinear(self.hidden_size, 2, bias=True, initialization='-5')
 
         self.puzzle_emb_len = -(self.puzzle_emb_ndim // -self.hidden_size)  # ceil div
+        assert self.puzzle_emb_len == 1, f'Not supported: {self.puzzle_emb_len=}'
         if self.puzzle_emb_ndim > 0:
-            raise NotImplementedError('puzzle_emb_ndim > 0 means there are multiple types of puzzles. Skip for now.')
             # Zero init puzzle embeddings
-            self.puzzle_emb = CastedSparseEmbedding(self.num_puzzle_identifiers, self.puzzle_emb_ndim,
-                                                    batch_size=self.batch_size, init_std=0, cast_to=self.forward_dtype)
+            # self.puzzle_emb = CastedSparseEmbedding(self.num_puzzle_identifiers, self.puzzle_emb_ndim,
+            #                                         batch_size=self.batch_size, init_std=0, cast_to=self.forward_dtype)
+            
+            # FIXME{zhh}: we currently only use naive nn.Embed. TODO: implement CastedSparseEmbedding and its optimizer
+            self.puzzle_emb = nn.Embed(self.num_puzzle_identifiers, self.puzzle_emb_ndim, embedding_init=nn.initializers.zeros)
 
         # LM Blocks
         if self.pos_encodings == "rope":
@@ -152,14 +155,17 @@ class HRM_ACTV1(nn.Module):
 
         # Puzzle embeddings
         if self.puzzle_emb_ndim > 0:
-            raise NotImplementedError
+            # raise NotImplementedError
             puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
             
-            pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
-            if pad_count > 0:
-                puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
+            pad_count = self.puzzle_emb_len * self.hidden_size - puzzle_embedding.shape[-1]
+            assert pad_count == 0, f'Not supported'
+            # if pad_count > 0:
+            #     puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
 
-            embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding), dim=-2)
+            embedding = jnp.concatenate((puzzle_embedding.reshape((-1, self.puzzle_emb_len, self.hidden_size)), embedding), axis=-2)
+        else:
+            raise NotImplementedError('puzzle_emb_ndim = 0 is very, very bad. q_head implementation is very wrong.')
 
         # Position embeddings
         if self.pos_encodings == "learned":
@@ -315,7 +321,7 @@ class HRM_ACTV1(nn.Module):
 
         return nn.while_loop(cond_fun, body_fun, self, output, carry_variables='buffer')
 
-HRM_debug = partial(HRM_ACTV1, H_cycles=2, L_cycles=2, H_layers=1, L_layers=1, halt_max_steps=2, halt_exploration_prob=0.1, hidden_size=4, num_heads=2, expansion=1.0)
+HRM_debug = partial(HRM_ACTV1, H_cycles=2, L_cycles=2, H_layers=1, L_layers=1, halt_max_steps=2, halt_exploration_prob=0.1, hidden_size=4, puzzle_emb_ndim=4, num_heads=2, expansion=1.0)
 HRM_default = partial(HRM_ACTV1, H_cycles=2, L_cycles=2, H_layers=4, L_layers=4, halt_max_steps=16, halt_exploration_prob=0.1)
 
 if __name__ == "__main__":

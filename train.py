@@ -141,8 +141,8 @@ def act_loss_and_metrics(buffer, outputs, loss_fn, train=True):
     assert all([v.shape == () for v in metrics.values()]), f"metrics: {dict((k, v.shape) for k, v in metrics.items())}"
     assert all(v.shape == () for v in [loss, ce_loss, q_halt_loss, q_continue_loss]), f"loss: {loss.shape}, ce_loss: {ce_loss.shape}, q_halt_loss: {q_halt_loss.shape}, q_continue_loss: {q_continue_loss.shape}"
     
-    return loss, metrics, outputs # for DEBUG
-    # return loss, metrics, outputs['logits'].argmax(axis=-1).astype(jnp.int32)
+    # return loss, metrics, outputs # for DEBUG
+    return loss, metrics, outputs['logits'].argmax(axis=-1).astype(jnp.int32)
 
 def compute_metrics(dict_losses):
     metrics = dict_losses.copy()
@@ -257,14 +257,14 @@ def train_and_evaluate(config, workdir):
                 )
                 summary.update({"ep": ep, "step": step})
                 logger.log(n_batch + 1, summary)
-                for k, v in vis.items():
-                    log_for_0(f'vis[{k}]: {(v.max(), v.min(), v.mean(), v.std())}') # DEBUG
-                    if jnp.isnan(v).any():
-                        log_for_0(f'Training diverged at epoch {epoch}, step {step}. Aborted.')
-                        exit(1)
-                # if jnp.isnan(vis).any():
-                #     log_for_0(f'Training diverged at epoch {epoch}, step {step}. Aborted.')
-                #     exit(1)
+                # for k, v in vis.items():
+                #     log_for_0(f'vis[{k}]: {(v.max(), v.min(), v.mean(), v.std())}') # DEBUG
+                #     if jnp.isnan(v).any():
+                #         log_for_0(f'Training diverged at epoch {epoch}, step {step}. Aborted.')
+                #         exit(1)
+                if jnp.isnan(vis).any():
+                    log_for_0(f'Training diverged at epoch {epoch}, step {step}. Aborted.')
+                    exit(1)
                 if epoch == -1: # means debug run
                     break
 
