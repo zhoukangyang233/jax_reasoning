@@ -59,8 +59,9 @@ def create_train_state(rng, config, total_steps, batch_size):
 
     return model, state, lr_fn
 
-def s(x, epsilon=1e-30):
-    return jnp.where(x<0, 1/(1-x+ epsilon), x + 1)
+def s(x, epsilon=1e-6):
+    # NOTE{zhh}: jax where is NOT ALWAYS short-circuiting!!!
+    return jnp.where(x<0, 1/jnp.clip(1 - x, epsilon), x + 1)
 
 def log_stablemax(x, axis=-1):
     s_x = s(x)
@@ -140,7 +141,7 @@ def act_loss_and_metrics(buffer, outputs, loss_fn, train=True):
     assert all([v.shape == () for v in metrics.values()]), f"metrics: {dict((k, v.shape) for k, v in metrics.items())}"
     assert all(v.shape == () for v in [loss, ce_loss, q_halt_loss, q_continue_loss]), f"loss: {loss.shape}, ce_loss: {ce_loss.shape}, q_halt_loss: {q_halt_loss.shape}, q_continue_loss: {q_continue_loss.shape}"
     
-    return loss, metrics, outputs
+    return loss, metrics, outputs # for DEBUG
     # return loss, metrics, outputs['logits'].argmax(axis=-1).astype(jnp.int32)
 
 def compute_metrics(dict_losses):
@@ -261,7 +262,9 @@ def train_and_evaluate(config, workdir):
                     if jnp.isnan(v).any():
                         log_for_0(f'Training diverged at epoch {epoch}, step {step}. Aborted.')
                         exit(1)
-                # log_for_0(f'vis: {vis[:, ::64]}') # DEBUG
+                # if jnp.isnan(vis).any():
+                #     log_for_0(f'Training diverged at epoch {epoch}, step {step}. Aborted.')
+                #     exit(1)
                 if epoch == -1: # means debug run
                     break
 
