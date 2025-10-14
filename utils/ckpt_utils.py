@@ -4,6 +4,7 @@ from flax.training import checkpoints
 from .logging_util import log_for_0
 import os
 import dataclasses
+from flax.jax_utils import unreplicate as U
 
 try:
     import gcsfs
@@ -65,9 +66,9 @@ def restore_checkpoint(state, workdir, allow_nockpt=False, ignore_keys=()):
 
 
 def save_checkpoint(state, workdir, ignore_keys=()):
-    state = {k.name: getattr(state, k.name) for k in dataclasses.fields(state) if k.name not in ignore_keys}
-    state = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], state))
+    state = jax.device_get(U(state))
     step = int(state.step)
+    state = {k.name: getattr(state, k.name) for k in dataclasses.fields(state) if k.name not in ignore_keys}
     log_for_0("Saving checkpoint step %d.", step)
     checkpoints.save_checkpoint_multiprocess(convert_to_gs(workdir), state, step, keep=2)
 
