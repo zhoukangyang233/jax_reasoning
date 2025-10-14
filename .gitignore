@@ -6,3 +6,8 @@ HRM/
 observe_dataset/
 fake_data/
 debug/
+
+.env
+
+other_data
+other_data2

@@ -63,12 +63,17 @@ def main(argv):
     logging.info("JAX local devices: %r", jax.local_devices())
     
     if FLAGS.debug:
+        raise NotImplementedError
         logging.info("Running in **DEBUG** mode. Disabling JIT compilation.")
         assert FLAGS.config.training.wandb == False, "Wandb logging should be closed in debug mode."
         with jax.disable_jit():
             train.train_and_evaluate(FLAGS.config, FLAGS.workdir)
     else:
         logging.info("Running **WITHOUT DEBUG** mode.")
+        if FLAGS.config.run_inference_folder:
+            logging.info("Running in INFERENCE FOLDER mode.")
+            return train.inference_folder(FLAGS.config, FLAGS.workdir)
+        
         train.train_and_evaluate(FLAGS.config, FLAGS.workdir)
 
 

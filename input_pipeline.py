@@ -93,7 +93,31 @@ class SudokuDataset(PuzzleDataset):
 
             sets=["all"]
         )
+
+class TestFolderDataset(PuzzleDataset):
+    FIELD_MMAP_MODES = {
+        "inputs": "r",
+        # "labels": "r", # NO labels
+        # Keep indices in memory
+        "puzzle_identifiers": None,
         
+        # NOTE{zhh}: these two are currently not used
+        # "puzzle_indices": None,
+        # "group_indices": None
+    }
+    
+    def __init__(self, root):
+        config = lambda: None
+        config.dataset_path = root
+        self.root = root
+        super().__init__(config, split='')
+        self._data['labels'] = np.zeros_like(self._data['inputs']) # dummy labels
+
+    def _load_metadata(self):
+        with open(os.path.join(self.root, "dataset.json"), 'r') as f:
+            metadata = json.load(f)
+        return PuzzleDatasetMetadata(**metadata)
+
 DATASET_CONFIG_TO_CLS = {
     "sudoku": SudokuDataset,
 }
@@ -167,6 +191,34 @@ def create_split(
     return it, steps_per_epoch, ds.metadata
 
 
+def create_split_from_folder(
+    root,
+    batch_size,
+):
+    rank = jax.process_index()
+    ds = TestFolderDataset(root=root)
+    log_for_0(ds)
+    sampler = torch.utils.data.distributed.DistributedSampler(
+        ds,
+        num_replicas=jax.process_count(),
+        rank=rank,
+        shuffle=False,  # don't shuffle for test
+    )
+    it = torch.utils.data.DataLoader(
+        ds,
+        batch_size=batch_size,
+        drop_last=False,  # don't drop for test
+        worker_init_fn=partial(worker_init_fn, rank=rank),
+        sampler=sampler,
+        num_workers=4,
+        prefetch_factor=2,
+        pin_memory=True,
+        persistent_workers=True,
+    )
+    steps_per_epoch = len(it)
+    log_for_all(f'Dataset is loaded')
+    return it, steps_per_epoch, ds.metadata
+
 #### DataLoader ####
 def worker_init_fn(worker_id, rank):
     seed = worker_id + rank * 1000
@@ -183,16 +235,22 @@ def prepare_batch_data(batch, batch_size=None, dataset_metdata=None):
     if metadata.ignore_label_id is not None:
         labels[labels == metadata.ignore_label_id] = IGNORE_LABEL_ID
     
-    batch = {"inputs": inputs, "labels": labels, "puzzle_identifiers": puzzle_identifiers}
+    batch = {"inputs": inputs, "labels": labels, "puzzle_identifiers": puzzle_identifiers, 'zhh_is_pad': labels * 0}
     # pad the batch if smaller than batch_size
     if batch_size is not None and batch_size > puzzle_identifiers.shape[0]:
         pad_values = {
-            "inputs": metadata.pad_id,
+            # "inputs": metadata.pad_id,
             "labels": IGNORE_LABEL_ID,
-            "puzzle_identifiers": metadata.blank_identifier_id
+            "puzzle_identifiers": metadata.blank_identifier_id,
+            'zhh_is_pad': 1,
         }
         pad_size = batch_size - puzzle_identifiers.shape[0]
-        batch = {k: torch.cat([v, torch.full((pad_size, ) + v.shape[1:], pad_values[k], dtype=v.dtype)], dim=0) for k, v in batch.items()}
+        inputs = batch["inputs"]
+        batch = {k: torch.cat([v, torch.full((pad_size, ) + v.shape[1:], pad_values[k], dtype=v.dtype)], dim=0) for k, v in batch.items() if k in pad_values}
+        
+        # NOTE{zhh}: this is a hack, pad inputs with last input, avoid bad inputs influence halt time
+        assert inputs.ndim == 2, f"inputs should be 2D, got {inputs.shape}"
+        batch["inputs"] = torch.cat([inputs, inputs[-1:].repeat(pad_size, 1)], dim=0)
 
     LDC = jax.local_device_count()
     return {k: (v.reshape((LDC, -1) + v.shape[1:])).numpy() for k, v in batch.items()}

@@ -78,7 +78,8 @@ if __name__ == "__main__":
          3,  7,  5, 10,  4,  9,  2,  6,  8,  4,  2,  9,  8,  6,  3,  5,  7, 10,
          2,  9,  6,  3,  5, 10,  4,  8,  7,  7,  5,  3,  9,  8,  4,  6, 10,  2,
          8,  4, 10,  2,  7,  6,  3,  9,  5])
+    # board = jnp.array([9, 8, 7, 2, 4, 6, 10, 3, 5, 6, 3, 4, 10, 5, 7, 9, 2, 8, 10, 5, 2, 9, 3, 8, 6, 4, 7, 8, 7, 10, 6, 2, 4, 3, 5, 9, 5, 2, 6, 8, 9, 3, 4, 7, 10, 3, 4, 9, 7, 10, 5, 2, 8, 6, 4, 6, 5, 3, 8, 9, 7, 10, 2, 7, 10, 8, 4, 6, 2, 5, 9, 3, 2, 9, 3, 5, 7, 10, 8, 6, 4])
 
-    img = sudoku_to_image(board, prompt=None)
-    # img = sudoku_to_image(board, prompt)
+    # img = sudoku_to_image(board, prompt=None)
+    img = sudoku_to_image(board, prompt)
     img.save("sudoku_example.png")

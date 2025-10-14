@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 import flax.linen as nn
 import optax
 import re
@@ -92,13 +93,13 @@ def valid_mean(validity, arr):
     arr = arr.astype(jnp.float32)
     return jnp.where(validity, arr, 0*arr).sum(axis=0) / jnp.maximum(jnp.sum(validity, axis=0), 1)
 
-def act_loss_and_metrics(buffer, outputs, loss_fn, train=True):
+def act_loss_and_metrics(buffer, outputs, loss_fn, train=True, label_info=None):
     # TODO{zhh}: verify correctness, especially data validity
     B, L, D = outputs["logits"].shape
     # labels.shape: [B, SeqLen]
 
     carry = buffer['carry']
-    labels = carry.current_data["labels"]
+    labels = carry.current_data["labels"] if label_info is None else label_info
 
     assert labels.shape == (B, L), f"labels.shape: {labels.shape}, B: {B}, L: {L}"
 
@@ -114,15 +115,15 @@ def act_loss_and_metrics(buffer, outputs, loss_fn, train=True):
     # losses
     ce_loss = loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID)
     assert ce_loss.shape == (B, L), f"ce_loss.shape: {ce_loss.shape}, B: {B}, L: {L}"
-    ce_loss = (ce_loss / jnp.maximum(jnp.sum(mask, axis=-1, keepdims=True), 1)).sum(axis=-1).mean(axis=0) # [B,]
-    q_halt_loss = optax.sigmoid_binary_cross_entropy(outputs['q_halt_logits'], seq_is_correct).mean(axis=0) # [B,]
+    ce_loss = (ce_loss / jnp.maximum(jnp.sum(mask, axis=-1, keepdims=True), 1)).sum(axis=-1).mean(axis=0) # []
+    q_halt_loss = optax.sigmoid_binary_cross_entropy(outputs['q_halt_logits'], seq_is_correct).mean(axis=0) # []
 
     q_continue_loss = q_halt_loss*0
     if train:
         q_continue_loss = optax.sigmoid_binary_cross_entropy(outputs['q_continue_logits'], outputs['target_q_continue']).mean(axis=0)
         
     loss = ce_loss + (q_halt_loss + q_continue_loss) * 0.5
-    
+
     metrics = {
         "valid_data_rate": (valid_data_num > 0).mean(axis=0),
         "valid_output_rate": valid_outputs.mean(axis=0),
@@ -146,8 +147,7 @@ def act_loss_and_metrics(buffer, outputs, loss_fn, train=True):
     return loss, metrics, outputs['logits'].argmax(axis=-1).astype(jnp.int32)
 
 def compute_metrics(dict_losses):
-    metrics = dict_losses.copy()
-    metrics = jax.lax.all_gather(metrics, axis_name="batch")
+    metrics = jax.lax.all_gather(dict_losses, axis_name="batch")
     metrics = jax.tree_map(lambda x: x.flatten(), metrics)  # (batch_size,)
     return metrics
 
@@ -168,9 +168,18 @@ def train_step(state: MutableTrainState, batch, loss_fn, init_rng, model, lr_fn)
 
 def eval_step(state: MutableTrainState, batch, loss_fn, model):
     variables = {'params': state.params, 'buffer': state.buffers, 'const': state.consts}
+    labels = batch['labels']
+    batch['labels'] *= 0 # avoid cheating
     out, new_state = model.apply(variables, batch, mutable=['buffer'], method=model.inference)
-    _, metrics, vis = act_loss_and_metrics(new_state['buffer'], out, loss_fn, train=False)
+    batch['labels'] = labels
+    _, metrics, vis = act_loss_and_metrics(new_state['buffer'], out, loss_fn, train=False, label_info=labels)
     return compute_metrics(metrics), vis
+
+def pure_inference_step(state: MutableTrainState, batch, model):
+    variables = {'params': state.params, 'buffer': state.buffers, 'const': state.consts}
+    out, new_state = model.apply(variables, batch, mutable=['buffer'], method=model.inference)
+    pred = out['logits'].argmax(axis=-1).astype(jnp.int32)
+    return jax.lax.all_gather(pred, axis_name='batch'), jax.lax.all_gather(batch['zhh_is_pad'], axis_name='batch')
 
 def wandb_init(config, workdir):
     if jax.process_index() == 0 and config.wandb.on_use:
@@ -212,7 +221,7 @@ def train_and_evaluate(config, workdir):
     # restore checkpoint if any
     epoch_offset = 0
     if config.load_from:
-        state = restore_checkpoint(state, config.load_from)
+        state = restore_checkpoint(state, config.load_from, ignore_keys=('buffers',))
         epoch_offset = int(state.step) // train_steps_per_epoch
         log_for_0(f"Resuming from checkpoint {config.load_from}, epoch_offset: {epoch_offset}")
 
@@ -242,6 +251,7 @@ def train_and_evaluate(config, workdir):
         log_for_0("Got config.just_evaluate=True. Just evaluate the model once and exit...")
         epoch_offset = config.training.epochs - 1
         train_dl = ()
+        step = 1
 
     timer.reset()
     for epoch in range(epoch_offset, config.training.epochs):
@@ -291,12 +301,71 @@ def train_and_evaluate(config, workdir):
             log_for_0(f"Epoch {epoch} eval done in {timer}.")
             
             # TODO: log visualizations
-            logger.log_image(step + 1, {f'data_{i}': sudoku_to_image(batch['labels'][0][i], prompt=batch['inputs'][0][i]) for i in range(4)})
-            logger.log_image(step + 1, {f'completion_{i}': sudoku_to_image(vis[0][i], prompt=batch['inputs'][0][i]) for i in range(4)})
+            assert len(batch['labels'][0]) >= config.training.num_vis, f"batch['labels'][0].shape: {batch['labels'][0].shape}, config.training.num_vis: {config.training.num_vis}"
+            logger.log_image(step + 1, {f'data_{i}': sudoku_to_image(batch['labels'][0][i], prompt=batch['inputs'][0][i]) for i in range(config.training.num_vis)})
+            logger.log_image(step + 1, {f'completion_{i}': sudoku_to_image(vis[0][i], prompt=batch['inputs'][0][i]) for i in range(config.training.num_vis)})
             
             if config.just_evaluate:
                 return
 
         # save checkpoint
         if (epoch + 1) % config.training.checkpoint_interval == 0 or (epoch + 1) == config.training.epochs:
-            save_checkpoint(state, workdir)
+            save_checkpoint(state, workdir, ignore_keys=('buffers',))
+
+            
+def inference_folder(config, workdir):
+    log_for_0('\n' + str(config))
+    rng = jax.random.key(config.training.seed)
+    log_for_0(f"JAX process index: {PCI} started with local devices {jax.local_devices()}")
+    
+    global_batch_size = config.training.batch_size
+    device_batch_size = global_batch_size // PCC
+    assert global_batch_size % (PCC) == 0 and device_batch_size % LDC == 0, f"global_batch_size: {global_batch_size}, PCC: {PCC}, LDC: {LDC}, local_batch_size: {device_batch_size}"
+    if PCC > 1:
+        log_for_0("[Warning] this function is inefficient when PCC > 1.")
+    
+    dl, steps_per_epoch, metadata = input_pipeline.create_split_from_folder(config.dataset.dataset_path, batch_size=device_batch_size)
+    
+    rng, init_rng = jax.random.split(rng)
+    model, state, _ = create_train_state(init_rng, config, total_steps=114514, batch_size=device_batch_size // LDC)
+    del init_rng
+    
+    assert config.load_from, "You must specify config.load_from for inference"
+    state = restore_checkpoint(state, config.load_from, ignore_keys=('buffers',))
+    log_for_0(f"Resuming from checkpoint {config.load_from}")
+    
+    state = R(state)
+    loss_fn = lambda: None
+    
+    rng, eval_rng = jax.random.split(rng)
+    p_inference_step = jax.pmap(partial(pure_inference_step, model=model), axis_name='batch')
+    test_batch = input_pipeline.prepare_batch_data(next(iter(dl)), batch_size=device_batch_size, dataset_metdata=metadata)
+    log_for_0("Compiling p_inference_step ...")
+    timer = Timer()
+    p_inference_step = p_inference_step.lower(state, test_batch).compile()
+    log_for_0(f"p_inference_step compiled in {timer}.")
+
+    all_samples = []
+    for n_batch, batch in enumerate(dl):
+        batch = input_pipeline.prepare_batch_data(batch, batch_size=device_batch_size, dataset_metdata=metadata)
+        pred, is_pad = p_inference_step(state, batch)
+        pred = pred[0].reshape(-1, pred.shape[-1]) # [B, SeqLen]
+        is_pad = is_pad[0].reshape(-1, is_pad.shape[-1]) # [B, SeqLen]
+
+        if n_batch % 200 == 0:
+            log_for_0(f"Inference batch {n_batch}/{steps_per_epoch} done.")
+        if n_batch == steps_per_epoch - 1:
+            # remove padding
+            num_padded = (is_pad == 1).all(axis=-1).sum()
+            num_padded = int(num_padded)
+            log_for_0(f"Last batch has {num_padded} padded samples.")
+            pred = pred[:-num_padded] if num_padded > 0 else pred
+
+        all_samples.append(jax.device_get(pred))
+
+    all_samples = np.concatenate(all_samples, axis=0) # [N, SeqLen]
+    log_for_0(f"Inference on {len(all_samples)} samples done in {timer}.")
+    if jax.process_index() == 0:
+        np.save(f"{workdir}/inference_results.npy", all_samples)
+    
+    log_for_0(f"Inference done. Samples saved to {workdir}.")

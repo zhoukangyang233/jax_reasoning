@@ -26,6 +26,7 @@ def get_config():
     training.eval_batch_size = 768
     training.epochs = 100_000
     training.log_per_step = 100
+    training.num_vis = 4
     training.eval_interval = 10_000
     training.checkpoint_interval = 10_000
     training.loss_fn = 'stablemax_cross_entropy'
@@ -42,6 +43,7 @@ def get_config():
     wandb.notes = ''
     
     # pretrained model
+    config.run_inference_folder = False
     config.just_evaluate = False
     config.load_from = ''
 

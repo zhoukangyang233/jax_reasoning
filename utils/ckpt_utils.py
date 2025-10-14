@@ -3,6 +3,7 @@ import jax
 from flax.training import checkpoints
 from .logging_util import log_for_0
 import os
+import dataclasses
 
 try:
     import gcsfs
@@ -38,27 +39,33 @@ def is_checkpoint(path):
         return path is not None and is_checkpoint(path)
     return True
 
-def restore_checkpoint(state, workdir, allow_nockpt=False):
-    if workdir:
-        for try_dir in [
-            workdir,
-        ]:
-            if is_checkpoint(try_dir):
-                return checkpoints.restore_checkpoint(try_dir, state)
-            
-        for try_dir in [
-            convert_to_gs(workdir),
-        ]:
-            if is_checkpoint(try_dir):
-                return checkpoints.restore_checkpoint(try_dir, state)
-    if allow_nockpt:
-        log_for_0(f'[WARNING] checkpoint does not exist on {workdir}, start from scratch')
-        return state
+def restore_checkpoint(state, workdir, allow_nockpt=False, ignore_keys=()):
+    retain_states = {k.name: getattr(state, k.name) for k in dataclasses.fields(state) if k.name in ignore_keys}
+
+    def _restore():
+        if workdir:
+            for try_dir in [
+                workdir,
+            ]:
+                if is_checkpoint(try_dir):
+                    return checkpoints.restore_checkpoint(try_dir, state)
+                
+            for try_dir in [
+                convert_to_gs(workdir),
+            ]:
+                if is_checkpoint(try_dir):
+                    return checkpoints.restore_checkpoint(try_dir, state)
+        if allow_nockpt:
+            log_for_0(f'[WARNING] checkpoint does not exist on {workdir}, start from scratch')
+            return state
+        
+        raise RuntimeError(f'checkpoint does not exist on {workdir}')
     
-    raise RuntimeError(f'checkpoint does not exist on {workdir}')
+    return _restore().replace(**retain_states)
 
 
-def save_checkpoint(state, workdir):
+def save_checkpoint(state, workdir, ignore_keys=()):
+    state = {k.name: getattr(state, k.name) for k in dataclasses.fields(state) if k.name not in ignore_keys}
     state = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], state))
     step = int(state.step)
     log_for_0("Saving checkpoint step %d.", step)
