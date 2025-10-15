@@ -6,7 +6,7 @@ def get_config():
     
     config.dataset = dataset = ml_collections.ConfigDict()
     dataset.dataset_cls = "sudoku"
-    dataset.dataset_path = "/kmh-nfs-ssd-us-mount/data/sudoku-extreme-full"
+    dataset.dataset_path = "/kmh-nfs-ssd-us-mount/data/sudoku-extreme-1k"
     
     dataset.seq_len = 81
     dataset.vocab_size = 11
@@ -25,7 +25,7 @@ def get_config():
     training.batch_size = 768
     training.eval_batch_size = 768
     training.epochs = 100_000
-    training.log_per_step = 100
+    training.log_per_epoch = 100
     training.num_vis = 4
     training.eval_interval = 10_000
     training.checkpoint_interval = 10_000

@@ -237,6 +237,8 @@ def train_and_evaluate(config, workdir):
     timer = Timer()
     p_train_step = p_train_step.lower(state, test_batch).compile()
     p_eval_step = p_eval_step.lower(state, test_batch).compile()
+    log_for_0(f"train flops: {p_train_step.cost_analysis()[0]['flops'] / 1e12:.2f} TFLOPS")
+    log_for_0(f"eval flops: {p_eval_step.cost_analysis()[0]['flops'] / 1e12:.2f} TFLOPS")
     log_for_0(f"p_train_step and p_eval_step compiled in {timer}.")
 
     # wandb init
@@ -251,37 +253,38 @@ def train_and_evaluate(config, workdir):
         log_for_0("Got config.just_evaluate=True. Just evaluate the model once and exit...")
         epoch_offset = config.training.epochs - 1
         train_dl = ()
-        step = 1
 
     timer.reset()
+    train_metrics = MyMetrics(reduction='avg')
     for epoch in range(epoch_offset, config.training.epochs):
-        log_for_0(f"Epoch {epoch} ...")
-        train_metrics = MyMetrics(reduction='avg')
+        # log_for_0(f"Epoch {epoch} ...")
+        step = epoch * train_steps_per_epoch
+        ep = epoch
         for n_batch, batch in enumerate(train_dl):
             batch = input_pipeline.prepare_batch_data(batch, batch_size=device_batch_size, dataset_metdata=train_metadata)
             state, metrics, vis = p_train_step(state, batch)
             train_metrics.update(metrics)
             step = epoch * train_steps_per_epoch + n_batch
             ep = epoch + n_batch / train_steps_per_epoch
-            
-            if (n_batch + 1) % config.training.log_per_step == 0:
-                summary = train_metrics.compute_and_reset()
-                summary = {f"train/{k}": v for k, v in summary.items()}
-                summary["steps_per_second"] = (
-                    config.training.log_per_step / timer.elapse_with_reset()
-                )
-                summary.update({"ep": ep, "step": step})
-                logger.log(step + 1, summary)
-                # for k, v in vis.items():
-                #     log_for_0(f'vis[{k}]: {(v.max(), v.min(), v.mean(), v.std())}') # DEBUG
-                #     if jnp.isnan(v).any():
-                #         log_for_0(f'Training diverged at epoch {epoch}, step {step}. Aborted.')
-                #         exit(1)
-                if jnp.isnan(vis).any():
-                    log_for_0(f'Training diverged at epoch {epoch}, step {step}. Aborted.')
-                    exit(1)
-                if epoch == -1: # means debug run
-                    break
+
+        if (epoch + 1) % config.training.log_per_epoch == 0:
+            summary = train_metrics.compute_and_reset()
+            summary = {f"train/{k}": v for k, v in summary.items()}
+            summary["epochs_per_second"] = (
+                config.training.log_per_epoch / timer.elapse_with_reset()
+            )
+            summary.update({"ep": ep, "step": step})
+            logger.log(step + 1, summary)
+            # for k, v in vis.items():
+            #     log_for_0(f'vis[{k}]: {(v.max(), v.min(), v.mean(), v.std())}') # DEBUG
+            #     if jnp.isnan(v).any():
+            #         log_for_0(f'Training diverged at epoch {epoch}, step {step}. Aborted.')
+            #         exit(1)
+            if jnp.isnan(vis).any():
+                log_for_0(f'Training diverged at epoch {epoch}, step {step}. Aborted.')
+                exit(1)
+            if epoch == -1: # means debug run
+                break
 
         # eval
         timer.reset()
@@ -306,12 +309,14 @@ def train_and_evaluate(config, workdir):
             logger.log_image(step + 1, {f'completion_{i}': sudoku_to_image(vis[0][i], prompt=batch['inputs'][0][i]) for i in range(config.training.num_vis)})
             
             if config.just_evaluate:
-                return
+                return jax.random.normal(jax.random.key(0), ()).block_until_ready()
 
         # save checkpoint
         if (epoch + 1) % config.training.checkpoint_interval == 0 or (epoch + 1) == config.training.epochs:
             save_checkpoint(state, workdir, ignore_keys=('buffers',))
-
+            log_for_0(f"Epoch {epoch} checkpoint saved.")
+    
+    return jax.random.normal(jax.random.key(0), ()).block_until_ready()  # wait for all computations to finish
             
 def inference_folder(config, workdir):
     log_for_0('\n' + str(config))

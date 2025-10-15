@@ -1,7 +1,7 @@
 # Reasoning Models in JAX
 <img src="sudoku_example.png" width="200px" style="display: block; margin-left: auto; margin-right: auto; margin-bottom: 20px; margin-top: 20px" />
 
-In this repo, we aim to implement [HRM](https://arxiv.org/abs/2506.21734) and [TRM](https://arxiv.org/abs/2510.04871v1) in JAX. We choose [sudoku-extreme](https://huggingface.co/datasets/sapientinc/sudoku-extreme) as the dataset.
+In this repo, we aim to implement [HRM](https://arxiv.org/abs/2506.21734) and [TRM](https://arxiv.org/abs/2510.04871v1) in JAX. We choose [sudoku-extreme-1k](https://huggingface.co/datasets/sapientinc/sudoku-extreme-1k) as the dataset.
 
 ## Configurations
 
@@ -32,8 +32,8 @@ In this repo, we aim to implement [HRM](https://arxiv.org/abs/2506.21734) and [T
 
     Notice that in this setting, `/path/to/any/dataset` may not even have labels inside it. Thus there is no possibility of data leaking.
 
-    The data is locally at `/kmh-nfs-ssd-us-mount/data/sudoku-extreme-full/`.
+    The data is locally at `/kmh-nfs-ssd-us-mount/data/sudoku-extreme-1k/`.
 
 ## Runs
 
-- [HRM Init run](https://wandb.ai/evazhu-massachusetts-institute-of-technology/TRM/runs/lr5w1tti) (test pass@1: $88.1\%$)
+<!-- - [HRM Init run](https://wandb.ai/evazhu-massachusetts-institute-of-technology/TRM/runs/lr5w1tti) (test pass@1: $88.1\%$) -->

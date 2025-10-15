@@ -86,6 +86,26 @@ class SudokuDataset(PuzzleDataset):
             num_puzzle_identifiers=1,
 
             total_groups={
+                'train': 1000,
+                'test': 1000,
+            }[self.split],
+            mean_puzzle_examples=1.0,
+
+            sets=["all"]
+        )
+
+class SudokuFullDataset(PuzzleDataset):
+    def _load_metadata(self):
+        return PuzzleDatasetMetadata(
+            pad_id=0,
+            ignore_label_id=0,
+            blank_identifier_id=0,
+
+            vocab_size=11,
+            seq_len=81,
+            num_puzzle_identifiers=1,
+
+            total_groups={
                 'train': 3831994,
                 'test': 422786,
             }[self.split],
@@ -122,10 +142,29 @@ DATASET_CONFIG_TO_CLS = {
     "sudoku": SudokuDataset,
 }
 
+# def merge_epochs(dataset, num_merge_epochs=-1):
+#     if num_merge_epochs <= 1:
+#         return dataset
+#     else:
+#         class MergedDataset(Dataset):
+#             def __init__(self, dataset, num_merge_epochs):
+#                 self.dataset = dataset
+#                 self.num_merge_epochs = num_merge_epochs
+
+#             def __len__(self):
+#                 return len(self.dataset) // self.num_merge_epochs
+
+#             def __getitem__(self, idx):
+#                 # Get the merged item
+#                 return self.dataset[idx * self.num_merge_epochs:(idx + 1) * self.num_merge_epochs]
+        
+#         return MergedDataset(dataset, num_merge_epochs)
+
 def create_split(
     dataset_cfg,
     batch_size,
     split,
+    # num_merge_epochs=-1
 ):
     """Creates a split from the ImageNet dataset using Torchvision Datasets.
 

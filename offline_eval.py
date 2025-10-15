@@ -61,3 +61,12 @@ print(f"Overall accuracy: {acc*100:.2f}%")
 # python offline_eval.py --pred /kmh-nfs-ssd-us-mount/staging/siri/sudoku/launch_20251014_220415_git31d4bb9_8bdca47e/logs/log1_20251014_220441_VMkmh-tpuvm-v4-8-8_a3386d3d/inference_results.npy --ans /kmh-nfs-ssd-us-mount/code/siri/jax_reasoning/all_datas/sudoku/sudoku_9_22_25_test/labels.npy --cfg /kmh-nfs-ssd-us-mount/code/siri/jax_reasoning/all_datas/sudoku/sudoku_9_22_25_test/test_folder/dataset.json
 # [WARNING] dtype mismatch. GT dtype: int64, pred dtype: int32. Converting pred to int64
 # Overall accuracy: 98.99%
+
+# train on 1k, valid on hard
+# python offline_eval.py --pred /kmh-nfs-ssd-us-mount/staging/siri/sudoku/launch_20251015_044013_git32736aa_aaa0556f/logs/log1_20251015_044039_VMkmh-tpuvm-v4-16-spot-kangyang-1_415d757d/inference_results.npy --ans /kmh-nfs-ssd-us-mount/data/sudoku-extreme-1k/test_hard/all__labels.npy --cfg /kmh-nfs-ssd-us-mount/data/sudoku-extreme-1k/test_hard/dataset.json
+
+# train on 1k, valid on hard
+# python offline_eval.py --pred /kmh-nfs-ssd-us-mount/staging/siri/sudoku/launch_20251015_044013_git32736aa_aaa0556f/logs/log1_20251015_044039_VMkmh-tpuvm-v4-16-spot-kangyang-1_415d757d/inference_results.npy --ans /kmh-nfs-ssd-us-mount/data/sudoku-extreme-1k/test_hard/all__labels.npy --cfg /kmh-nfs-ssd-us-mount/data/sudoku-extreme-1k/test_hard/dataset.json
+
+# sudoku bench
+# python offline_eval.py --pred /kmh-nfs-ssd-us-mount/staging/siri/sudoku/launch_20251015_045023_git32736aa_ad03acc8/logs/log1_20251015_045049_VMkmh-tpuvm-v4-16-spot-kangyang-1_36c62af9/inference_results.npy --ans /kmh-nfs-ssd-us-mount/data/sudoku-extreme-1k/test_sudoku_bench/all__labels.npy --cfg /kmh-nfs-ssd-us-mount/data/sudoku-extreme-1k/test_sudoku_bench/dataset.json
