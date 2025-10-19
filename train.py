@@ -253,6 +253,8 @@ def train_and_evaluate(config, workdir):
         log_for_0("Got config.just_evaluate=True. Just evaluate the model once and exit...")
         epoch_offset = config.training.epochs - 1
         train_dl = ()
+    print(config.training.log_per_epoch)
+    print(config.training.eval_interval)
 
     timer.reset()
     train_metrics = MyMetrics(reduction='avg')
@@ -266,7 +268,8 @@ def train_and_evaluate(config, workdir):
             train_metrics.update(metrics)
             step = epoch * train_steps_per_epoch + n_batch
             ep = epoch + n_batch / train_steps_per_epoch
-
+        # Print the length of train rounds
+        print(f"Epoch {epoch} done in {timer}. Length of this round: {step - epoch * train_steps_per_epoch + 1} steps.")
         if (epoch + 1) % config.training.log_per_epoch == 0:
             summary = train_metrics.compute_and_reset()
             summary = {f"train/{k}": v for k, v in summary.items()}

@@ -10,6 +10,7 @@ import json
 import numpy as np
 import pydantic
 import random
+import itertools
 from functools import partial
 
 import jax
@@ -60,15 +61,47 @@ class PuzzleDataset(Dataset):
             }
         log_for_0(f'Dataset loaded.')
 
-        if len(self) != self.metadata.total_groups:
-            log_for_0(f"\033[31mWARNING: Dataset size {len(self)} does not match metadata {self.metadata.total_groups}.\033[0m")
+        self.augmentations_per_puzzle = int(getattr(config, "augmentations_per_puzzle", 0))
+        if self.augmentations_per_puzzle < 0:
+            raise ValueError(f"augmentations_per_puzzle must be >= 0, got {self.augmentations_per_puzzle}")
+
+        self._base_len = len(self._data['inputs'])
+        self._length = self._base_len * (self.augmentations_per_puzzle + 1)
+
+        if self.augmentations_per_puzzle:
+            self.metadata.total_groups = self._length
+            log_for_0(
+                f"Applying {self.augmentations_per_puzzle} augmentations per puzzle; effective dataset size {self._length}."
+            )
+        elif self._length != self.metadata.total_groups:
+            log_for_0(
+                f"\033[31mWARNING: Dataset size {self._length} does not match metadata {self.metadata.total_groups}.\033[0m"
+            )
             
     def __getitem__(self, index):
-        t = self._data['inputs'][index], self._data['labels'][index], np.array(self._data['puzzle_identifiers'][index])
+        base_index = index % self._base_len
+        augmentation_index = index // self._base_len
+
+        inputs = np.array(self._data['inputs'][base_index], copy=True)
+        labels = np.array(self._data['labels'][base_index], copy=True)
+        puzzle_identifier = np.array(self._data['puzzle_identifiers'][base_index])
+
+        if augmentation_index > 0 and self.augmentations_per_puzzle:
+            inputs, labels = self._augment_example(
+                inputs,
+                labels,
+                augmentation_index - 1,
+                base_index,
+            )
+
+        t = (inputs, labels, puzzle_identifier)
         return tuple(torch.from_numpy(x.astype('int32')) for x in t)
 
     def __len__(self):
-        return len(self._data['inputs'])
+        return self._length
+
+    def _augment_example(self, inputs, labels, aug_index, base_index):
+        return inputs, labels
     
     def __str__(self):
         md = '\n\t\t'.join([f"{k}: {v}" for k, v in self.metadata.model_dump().items()])
@@ -94,6 +127,44 @@ class SudokuDataset(PuzzleDataset):
             sets=["all"]
         )
 
+    def _augment_example(self, inputs, labels, aug_index, base_index):
+        rng = np.random.default_rng((base_index + 1) * 1000 + aug_index)
+        board_inputs = inputs.reshape(9, 9)
+        board_labels = labels.reshape(9, 9)
+
+        transform_id = int(rng.integers(0, 8))
+        board_inputs = dihedral_transform(board_inputs, transform_id)
+        board_labels = dihedral_transform(board_labels, transform_id)
+
+        row_groups = np.arange(9).reshape(3, 3)
+        for band in range(3):
+            perm_choice = PERMUTATIONS_3[int(rng.integers(0, 6))]
+            row_groups[band] = row_groups[band][perm_choice]
+        band_perm_choice = PERMUTATIONS_3[int(rng.integers(0, 6))]
+        row_groups = row_groups[band_perm_choice]
+        row_indices = row_groups.reshape(-1)
+
+        col_groups = np.arange(9).reshape(3, 3)
+        for stack in range(3):
+            perm_choice = PERMUTATIONS_3[int(rng.integers(0, 6))]
+            col_groups[stack] = col_groups[stack][perm_choice]
+        stack_perm_choice = PERMUTATIONS_3[int(rng.integers(0, 6))]
+        col_groups = col_groups[stack_perm_choice]
+        col_indices = col_groups.reshape(-1)
+
+        board_inputs = board_inputs[row_indices][:, col_indices]
+        board_labels = board_labels[row_indices][:, col_indices]
+
+        vocab_size = self.metadata.vocab_size
+        mapping = np.arange(vocab_size, dtype=board_labels.dtype)
+        digit_tokens = np.arange(1, min(vocab_size, 10), dtype=board_labels.dtype)
+        if digit_tokens.size:
+            mapping[digit_tokens] = rng.permutation(digit_tokens)
+
+        board_inputs = mapping[board_inputs]
+        board_labels = mapping[board_labels]
+
+        return board_inputs.reshape(-1), board_labels.reshape(-1)
 class SudokuFullDataset(PuzzleDataset):
     def _load_metadata(self):
         return PuzzleDatasetMetadata(
@@ -299,6 +370,7 @@ def prepare_batch_data(batch, batch_size=None, dataset_metdata=None):
 # Global list mapping each dihedral transform id to its inverse.
 # Index corresponds to the original tid, and the value is its inverse.
 DIHEDRAL_INVERSE = [0, 3, 2, 1, 4, 5, 6, 7]
+PERMUTATIONS_3 = np.array(list(itertools.permutations(range(3))), dtype=np.int32)
 
 def dihedral_transform(arr: np.ndarray, tid: int) -> np.ndarray:
     """8 dihedral symmetries by rotate, flip and mirror"""

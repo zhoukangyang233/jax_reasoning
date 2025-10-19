@@ -10,3 +10,5 @@ debug/
 .env
 
 all_datas/
+run/
+*.sh

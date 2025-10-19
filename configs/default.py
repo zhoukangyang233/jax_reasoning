@@ -7,12 +7,13 @@ def get_config():
     config.dataset = dataset = ml_collections.ConfigDict()
     dataset.dataset_cls = "sudoku"
     dataset.dataset_path = "/kmh-nfs-ssd-us-mount/data/sudoku-extreme-1k"
+    dataset.augmentations_per_puzzle = 0
     
     dataset.seq_len = 81
     dataset.vocab_size = 11
     dataset.num_puzzle_identifiers = 1
     
-    dataset.num_workers = 4
+    dataset.num_workers = 16
     dataset.prefetch_factor = 2
     dataset.pin_memory = False
     dataset.cache = True
@@ -25,7 +26,7 @@ def get_config():
     training.batch_size = 768
     training.eval_batch_size = 768
     training.epochs = 100_000
-    training.log_per_epoch = 100
+    training.log_per_epoch = 10
     training.num_vis = 4
     training.eval_interval = 10_000
     training.checkpoint_interval = 10_000
