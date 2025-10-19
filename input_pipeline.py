@@ -6,6 +6,7 @@ from typing import List, Optional
 
 import os
 import json
+import copy
 
 import numpy as np
 import pydantic
@@ -64,15 +65,39 @@ class PuzzleDataset(Dataset):
         self.augmentations_per_puzzle = int(getattr(config, "augmentations_per_puzzle", 0))
         if self.augmentations_per_puzzle < 0:
             raise ValueError(f"augmentations_per_puzzle must be >= 0, got {self.augmentations_per_puzzle}")
+        self.augmentation_refresh_interval = int(getattr(config, "augmentation_refresh_interval", 0))
+        if self.augmentation_refresh_interval < 0:
+            raise ValueError(
+                f"augmentation_refresh_interval must be >= 0, got {self.augmentation_refresh_interval}"
+            )
+        self._augmentation_seed_stride = int(getattr(config, "augmentation_seed_stride", 1_000_003))
+        if self._augmentation_seed_stride <= 0:
+            raise ValueError(
+                f"augmentation_seed_stride must be > 0, got {self._augmentation_seed_stride}"
+            )
 
         self._base_len = len(self._data['inputs'])
         self._length = self._base_len * (self.augmentations_per_puzzle + 1)
+
+        # Use an epoch-driven refresh id for augmentations. The previous
+        # implementation tracked per-(base_index, aug_index) usage counts in
+        # process memory which is not safe when DataLoader spawns multiple
+        # worker processes (each worker would have its own copy). Instead we
+        # drive refreshes deterministically from an externally-set epoch via
+        # `set_augmentation_epoch` so behavior is correct with multi-worker
+        # loading.
+        self._augmentation_epoch = 0
+        self._augmentation_usage_counts = None
 
         if self.augmentations_per_puzzle:
             self.metadata.total_groups = self._length
             log_for_0(
                 f"Applying {self.augmentations_per_puzzle} augmentations per puzzle; effective dataset size {self._length}."
             )
+            if self.augmentation_refresh_interval > 0:
+                log_for_0(
+                    f"Refresh augmented variants every {self.augmentation_refresh_interval} epoch(s)."
+                )
         elif self._length != self.metadata.total_groups:
             log_for_0(
                 f"\033[31mWARNING: Dataset size {self._length} does not match metadata {self.metadata.total_groups}.\033[0m"
@@ -102,6 +127,33 @@ class PuzzleDataset(Dataset):
 
     def _augment_example(self, inputs, labels, aug_index, base_index):
         return inputs, labels
+
+    def _next_augmentation_rng(self, base_index: int, aug_index: int):
+        if self.augmentations_per_puzzle <= 0:
+            raise ValueError("No augmentations configured for this dataset instance.")
+
+        base_index = int(base_index)
+        aug_index = int(aug_index)
+        base_seed = (base_index + 1) * 1000 + aug_index
+
+        # If refresh is requested, compute refresh id deterministically from
+        # the externally provided epoch. This is safe with multiple DataLoader
+        # workers because the epoch is set from the parent process.
+        if self.augmentation_refresh_interval > 0:
+            refresh_id = int(self._augmentation_epoch) // self.augmentation_refresh_interval
+            seed = base_seed + refresh_id * self._augmentation_seed_stride
+            return np.random.default_rng(seed)
+
+        return np.random.default_rng(base_seed)
+
+    def set_augmentation_epoch(self, epoch: int):
+        """Set the current epoch used to compute augmentation refresh ids.
+
+        Call this once per training epoch (from the main process) with the
+        current epoch number. This keeps augmentation refresh deterministic
+        and correct when using multi-worker DataLoader.
+        """
+        self._augmentation_epoch = int(epoch)
     
     def __str__(self):
         md = '\n\t\t'.join([f"{k}: {v}" for k, v in self.metadata.model_dump().items()])
@@ -128,7 +180,7 @@ class SudokuDataset(PuzzleDataset):
         )
 
     def _augment_example(self, inputs, labels, aug_index, base_index):
-        rng = np.random.default_rng((base_index + 1) * 1000 + aug_index)
+        rng = self._next_augmentation_rng(base_index, aug_index)
         board_inputs = inputs.reshape(9, 9)
         board_labels = labels.reshape(9, 9)
 
@@ -273,7 +325,10 @@ def create_split(
         )
         steps_per_epoch = len(it)
     elif split == 'test':
-        ds = dataset_cls(config=dataset_cfg, split=split)
+        test_dataset_cfg = copy.deepcopy(dataset_cfg)
+        if hasattr(test_dataset_cfg, "augmentations_per_puzzle"):
+            test_dataset_cfg.augmentations_per_puzzle = 0  # disable augmentation for evaluation
+        ds = dataset_cls(config=test_dataset_cfg, split=split)
         log_for_0(ds)
         sampler = torch.utils.data.distributed.DistributedSampler(
             ds,

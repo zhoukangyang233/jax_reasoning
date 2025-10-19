@@ -5,6 +5,13 @@ import flax.linen as nn
 import optax
 import re
 from functools import partial
+
+try:
+    import matplotlib
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
 from flax.training import train_state
 from flax import struct
 from flax.jax_utils import replicate as R
@@ -173,7 +180,27 @@ def eval_step(state: MutableTrainState, batch, loss_fn, model):
     out, new_state = model.apply(variables, batch, mutable=['buffer'], method=model.inference)
     batch['labels'] = labels
     _, metrics, vis = act_loss_and_metrics(new_state['buffer'], out, loss_fn, train=False, label_info=labels)
-    return compute_metrics(metrics), vis
+    logits = out['logits']
+    predictions = logits.argmax(axis=-1).astype(jnp.int32)
+    valid_mask = labels != IGNORE_LABEL_ID
+    seq_correct = jnp.all(jnp.where(valid_mask, predictions == labels, True), axis=-1)
+
+    carry = new_state['buffer']['carry']
+    halted = carry.halted
+    steps = carry.steps.astype(jnp.int32)
+    stop_steps = jnp.where(halted, steps, 17)  # shape: (local_device_count, local_batch)
+    # Padding rows are introduced when the dataloader needs to round out the last microbatch.
+    # `zhh_is_pad` marks those rows with 1s for every token position.
+    is_pad = (batch['zhh_is_pad'] > 0).all(axis=-1)  # shape matched to stop_steps
+
+    stats = {
+        "stop_steps": jax.lax.all_gather(stop_steps, axis_name='batch'),
+        "seq_correct": jax.lax.all_gather(seq_correct, axis_name='batch'),
+        "is_pad": jax.lax.all_gather(is_pad, axis_name='batch'),
+    }
+    stats = {k: v.reshape(-1) for k, v in stats.items()}
+
+    return compute_metrics(metrics), vis, stats
 
 def pure_inference_step(state: MutableTrainState, batch, model):
     variables = {'params': state.params, 'buffer': state.buffers, 'const': state.consts}
@@ -259,11 +286,13 @@ def train_and_evaluate(config, workdir):
     timer.reset()
     train_metrics = MyMetrics(reduction='avg')
     for epoch in range(epoch_offset, config.training.epochs):
-        # log_for_0(f"Epoch {epoch} ...")
+        log_for_0(f"Epoch {epoch} ...")
         step = epoch * train_steps_per_epoch
         ep = epoch
         for n_batch, batch in enumerate(train_dl):
-            batch = input_pipeline.prepare_batch_data(batch, batch_size=device_batch_size, dataset_metdata=train_metadata)
+            batch = input_pipeline.prepare_batch_data(batch, batch_size=device_batch_size,
+             dataset_metdata=train_metadata)
+            #log_for_0(f"Prepared batch {n_batch} for training in epoch {epoch}.")
             state, metrics, vis = p_train_step(state, batch)
             train_metrics.update(metrics)
             step = epoch * train_steps_per_epoch + n_batch
@@ -294,17 +323,79 @@ def train_and_evaluate(config, workdir):
         if config.just_evaluate or (epoch + 1) % config.training.eval_interval == 0:
             log_for_0(f"Evaluating on epoch {epoch} ...")
             eval_metrics = MyMetrics(reduction='avg')
+            eval_stop_steps = []
+            eval_seq_correct = []
+            eval_is_pad = []
             for n_batch, batch in enumerate(eval_dl):
                 batch = input_pipeline.prepare_batch_data(batch, batch_size=device_batch_size, dataset_metdata=eval_metadata)
-                metrics, vis = p_eval_step(state, batch)
+                metrics, vis, stats = p_eval_step(state, batch)
                 eval_metrics.update(metrics)
+                eval_stop_steps.append(np.asarray(stats["stop_steps"]).astype(np.int32))
+                eval_seq_correct.append(np.asarray(stats["seq_correct"]).astype(bool))
+                eval_is_pad.append(np.asarray(stats["is_pad"]).astype(bool))
                 if epoch == -1: # means debug run
                     break
-            log_for_0(f"Epoch {epoch} evaluation done. " + ", ".join([f"{k}: {v:.4f}" for k, v in eval_metrics.compute().items()]))
-            summary = eval_metrics.compute()
-            summary = {f"eval/{k}": v for k, v in summary.items()}
+            eval_time = timer.elapse_with_reset()
+            eval_summary = eval_metrics.compute()
+            log_for_0(f"Epoch {epoch} evaluation done. " + ", ".join([f"{k}: {v:.4f}" for k, v in eval_summary.items()]))
+
+            if eval_stop_steps:
+                stop_steps = np.concatenate(eval_stop_steps, axis=0)  # shape: (num_samples,)
+                seq_correct = np.concatenate(eval_seq_correct, axis=0)
+                is_pad = np.concatenate(eval_is_pad, axis=0)
+                valid_mask = ~is_pad  # padded rows are excluded from statistics
+                stop_steps = stop_steps[valid_mask]
+                seq_correct = seq_correct[valid_mask]
+            else:
+                stop_steps = np.array([], dtype=np.int32)
+                seq_correct = np.array([], dtype=bool)
+
+            # Clamp to [0, 17]; 17 represents sequences that never emitted a halt signal within 16 steps.
+            stop_steps = np.clip(stop_steps.astype(np.int32), 0, 17)
+            correct_steps = stop_steps[seq_correct]
+            incorrect_steps = stop_steps[~seq_correct]
+
+            avg_stop_correct = float(correct_steps.mean()) if correct_steps.size else float("nan")
+            avg_stop_incorrect = float(incorrect_steps.mean()) if incorrect_steps.size else float("nan")
+            hist_correct = np.bincount(correct_steps, minlength=18) if correct_steps.size else np.zeros(18, dtype=np.int32)
+            hist_incorrect = np.bincount(incorrect_steps, minlength=18) if incorrect_steps.size else np.zeros(18, dtype=np.int32)
+
+            log_for_0(
+                f"Epoch {epoch} eval time: {eval_time:.2f} s. "
+                f"Avg stop steps (correct/incorrect): {avg_stop_correct:.2f}/{avg_stop_incorrect:.2f}"
+            )
+            log_for_0(
+                f"Stop-time histograms -> correct: {hist_correct.tolist()}, incorrect: {hist_incorrect.tolist()}"
+            )
+
+            histogram_image = None
+            if plt is not None and stop_steps.size:
+                fig, ax = plt.subplots(figsize=(8, 4))
+                x = np.arange(18)
+                width = 0.4
+                ax.bar(x - width / 2, hist_correct, width=width, label="Correct")
+                ax.bar(x + width / 2, hist_incorrect, width=width, label="Incorrect")
+                ax.set_xticks(x)
+                ax.set_xlabel("Steps")
+                ax.set_ylabel("Count")
+                ax.set_title("Stop Time Distribution")
+                ax.legend()
+                fig.tight_layout()
+                fig.canvas.draw()
+                histogram_image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+                histogram_image = histogram_image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+                plt.close(fig)
+
+            summary = {f"eval/{k}": v for k, v in eval_summary.items()}
+            summary.update({
+                "eval/eval_time_seconds": float(eval_time),
+                "eval/avg_stop_steps_correct": avg_stop_correct,
+                "eval/avg_stop_steps_incorrect": avg_stop_incorrect,
+            })
             logger.log(step + 1, summary)
-            log_for_0(f"Epoch {epoch} eval done in {timer}.")
+
+            if histogram_image is not None:
+                logger.log_image(step + 1, {"eval_stop_time_distribution": histogram_image})
             
             # TODO: log visualizations
             assert len(batch['labels'][0]) >= config.training.num_vis, f"batch['labels'][0].shape: {batch['labels'][0].shape}, config.training.num_vis: {config.training.num_vis}"

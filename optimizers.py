@@ -22,7 +22,7 @@ def create_lr_fn(training_config, total_steps):
     return lambda step: cosine_schedule_with_warmup_lr_lambda(
         step,
         base_lr=training_config.learning_rate,
-        num_warmup_steps=training_config.warmup_steps,
+        num_warmup_steps=training_config.warmup_epochs * (total_steps // training_config.epochs),
         num_training_steps=total_steps,
         min_ratio=training_config.lr_min_ratio,
     )

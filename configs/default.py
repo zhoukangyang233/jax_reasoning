@@ -8,6 +8,7 @@ def get_config():
     dataset.dataset_cls = "sudoku"
     dataset.dataset_path = "/kmh-nfs-ssd-us-mount/data/sudoku-extreme-1k"
     dataset.augmentations_per_puzzle = 0
+    dataset.augmentation_refresh_interval = 0
     
     dataset.seq_len = 81
     dataset.vocab_size = 11
@@ -36,7 +37,8 @@ def get_config():
     training.learning_rate = 1e-4
     training.lr_schedule = 'cos'
     training.lr_min_ratio = 1.0
-    training.warmup_steps = 2_000
+    #training.warmup_steps = 2_000
+    training.warmup_epochs = 20
     training.weight_decay = 0.1
 
     config.wandb = wandb = ml_collections.ConfigDict()
