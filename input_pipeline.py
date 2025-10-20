@@ -79,15 +79,10 @@ class PuzzleDataset(Dataset):
         self._base_len = len(self._data['inputs'])
         self._length = self._base_len * (self.augmentations_per_puzzle + 1)
 
-        # Use an epoch-driven refresh id for augmentations. The previous
-        # implementation tracked per-(base_index, aug_index) usage counts in
-        # process memory which is not safe when DataLoader spawns multiple
-        # worker processes (each worker would have its own copy). Instead we
-        # drive refreshes deterministically from an externally-set epoch via
-        # `set_augmentation_epoch` so behavior is correct with multi-worker
-        # loading.
         self._augmentation_epoch = 0
-        self._augmentation_usage_counts = None
+        # Per-puzzle finish counts (used to trigger augmentation refresh when puzzles complete)
+        # Shape: (base_len,) integers
+        self._augmentation_usage_counts = np.zeros((self._base_len,), dtype=np.int32)
 
         if self.augmentations_per_puzzle:
             self.metadata.total_groups = self._length
@@ -140,8 +135,18 @@ class PuzzleDataset(Dataset):
         # the externally provided epoch. This is safe with multiple DataLoader
         # workers because the epoch is set from the parent process.
         if self.augmentation_refresh_interval > 0:
+            # Compute epoch-based refresh id
             refresh_id = int(self._augmentation_epoch) // self.augmentation_refresh_interval
             seed = base_seed + refresh_id * self._augmentation_seed_stride
+
+            # Additionally, if this specific base puzzle's finish_count reached a multiple of
+            # augmentation_refresh_interval, incorporate that into the refresh id so its
+            # augmented variants will rotate.
+            fc = int(self._augmentation_usage_counts[base_index])
+            if self.augmentation_refresh_interval > 0 and fc > 0 and (fc % self.augmentation_refresh_interval) == 0:
+                # change refresh id deterministically for this puzzle
+                seed = seed + (fc // self.augmentation_refresh_interval + 1) * (self._augmentation_seed_stride // 2)
+
             return np.random.default_rng(seed)
 
         return np.random.default_rng(base_seed)
@@ -158,6 +163,22 @@ class PuzzleDataset(Dataset):
     def __str__(self):
         md = '\n\t\t'.join([f"{k}: {v}" for k, v in self.metadata.model_dump().items()])
         return f"{self.__class__.__name__}\n\t- split: {self.split}\n\t- size: {len(self)}\n\t- metadata:\n\t\t{md}"
+
+    def increment_finish_counts(self, puzzle_ids):
+        """Increment per-puzzle finish counts for the provided base puzzle ids.
+
+        puzzle_ids: a 1-D numpy array or list of base indices. Values < 0 are ignored.
+        """
+        if puzzle_ids is None:
+            return
+        ids = np.asarray(puzzle_ids).ravel()
+        # ignore negative ids
+        ids = ids[ids >= 0]
+        if ids.size == 0:
+            return
+        # Count occurrences and add
+        unique, counts = np.unique(ids, return_counts=True)
+        self._augmentation_usage_counts[unique] += counts.astype(np.int32)
 
 class SudokuDataset(PuzzleDataset):
     def _load_metadata(self):
@@ -353,7 +374,7 @@ def create_split(
     else:
         raise ValueError(f"Unknown split {split}.")
     log_for_all(f'Dataset is loaded')
-    return it, steps_per_epoch, ds.metadata
+    return it, steps_per_epoch, ds.metadata, ds
 
 
 def create_split_from_folder(
@@ -382,7 +403,7 @@ def create_split_from_folder(
     )
     steps_per_epoch = len(it)
     log_for_all(f'Dataset is loaded')
-    return it, steps_per_epoch, ds.metadata
+    return it, steps_per_epoch, ds.metadata, ds
 
 #### DataLoader ####
 def worker_init_fn(worker_id, rank):

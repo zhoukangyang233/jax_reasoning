@@ -131,14 +131,30 @@ def act_loss_and_metrics(buffer, outputs, loss_fn, train=True, label_info=None):
         
     loss = ce_loss + (q_halt_loss + q_continue_loss) * 0.5
 
+    # Basic rates (means across the local batch/device)
     metrics = {
         "valid_data_rate": (valid_data_num > 0).mean(axis=0),
         "valid_output_rate": valid_outputs.mean(axis=0),
         "acc_per_token": is_correct.mean(axis=1).mean(axis=0), # just monitor ce
-        "pass@1": (valid_outputs & seq_is_correct).mean(axis=0), # this is the final acc
-        "valid_output_acc": valid_mean(valid_outputs, seq_is_correct),
-        "q_halt_acc": valid_mean(valid_outputs, q_halt_acc),
-        "inference_steps": valid_mean(valid_outputs, carry.steps),
+        "pass_at_this_round": (valid_outputs & seq_is_correct).mean(axis=0), # this is the final acc
+
+        # We still keep the per-device conditional mean for quick inspection,
+        # but also emit numerator/denominator so callers can compute a global
+        # weighted value across devices/hosts which is the correct statistic.
+    "valid_pass@1": valid_mean(valid_outputs, seq_is_correct),
+    "valid_pass@1_n": jnp.where(valid_outputs, seq_is_correct.astype(jnp.float32), 0).sum(axis=0),
+
+    "q_halt_acc": valid_mean(valid_outputs, q_halt_acc),
+    "q_halt_acc_n": jnp.where(valid_outputs, q_halt_acc.astype(jnp.float32), 0).sum(axis=0),
+
+    # inference steps: emit sum of steps over valid outputs so the true
+    # average steps can be derived globally. We use a single shared
+    # denominator `valid_outputs_count` because all three metrics share it.
+    "inference_steps": valid_mean(valid_outputs, carry.steps),
+    "inference_steps_n": jnp.where(valid_outputs, carry.steps.astype(jnp.float32), 0).sum(axis=0),
+
+    # shared denominator: count of valid outputs per device
+    "valid_outputs_count": jnp.sum(valid_outputs, axis=0),
 
         # loss
         "ce_loss": ce_loss,
@@ -171,7 +187,15 @@ def train_step(state: MutableTrainState, batch, loss_fn, init_rng, model, lr_fn)
     new_state = state.apply_gradients(grads=grads, buffers=new_buffers)
     metrics['learning_rate'] = lr_fn(state.step)
 
-    return new_state, compute_metrics(metrics), vis
+    # Compute which samples newly halted on this step (per-device)
+    old_carry = state.buffers['carry']
+    new_carry = new_buffers['carry']
+    newly_halted_mask = (new_carry.halted & (~old_carry.halted)).astype(jnp.int32)
+    # puzzle identifiers to report
+    puzzle_ids = new_carry.current_data['puzzle_identifiers'].astype(jnp.int32)
+    newly_halted_ids = jnp.where(newly_halted_mask, puzzle_ids, -1).astype(jnp.int32)
+
+    return new_state, compute_metrics(metrics), vis, newly_halted_ids
 
 def eval_step(state: MutableTrainState, batch, loss_fn, model):
     variables = {'params': state.params, 'buffer': state.buffers, 'const': state.consts}
@@ -235,8 +259,8 @@ def train_and_evaluate(config, workdir):
     device_eval_batch_size = global_eval_batch_size // PCC
     assert global_batch_size % (PCC) == 0 and device_batch_size % LDC == 0, f"global_batch_size: {global_batch_size}, PCC: {PCC}, LDC: {LDC}, local_batch_size: {device_batch_size}"
     assert global_eval_batch_size % (PCC) == 0 and device_eval_batch_size % LDC == 0, f"global_eval_batch_size: {global_eval_batch_size}, PCC: {PCC}, LDC: {LDC}, local_eval_batch_size: {device_eval_batch_size}"
-    train_dl, train_steps_per_epoch, train_metadata = input_pipeline.create_split(dataset_cfg, split='train', batch_size=device_batch_size)
-    eval_dl, eval_steps_per_epoch, eval_metadata = input_pipeline.create_split(dataset_cfg, split='test', batch_size=device_eval_batch_size)
+    train_dl, train_steps_per_epoch, train_metadata, train_ds = input_pipeline.create_split(dataset_cfg, split='train', batch_size=device_batch_size)
+    eval_dl, eval_steps_per_epoch, eval_metadata, eval_ds = input_pipeline.create_split(dataset_cfg, split='test', batch_size=device_eval_batch_size)
     log_for_0(f"train_steps_per_epoch: {train_steps_per_epoch}, eval_steps_per_epoch: {eval_steps_per_epoch}")
     total_steps = config.training.epochs * train_steps_per_epoch
     
@@ -293,7 +317,14 @@ def train_and_evaluate(config, workdir):
             batch = input_pipeline.prepare_batch_data(batch, batch_size=device_batch_size,
              dataset_metdata=train_metadata)
             #log_for_0(f"Prepared batch {n_batch} for training in epoch {epoch}.")
-            state, metrics, vis = p_train_step(state, batch)
+            state, metrics, vis, newly_halted = p_train_step(state, batch)
+            # newly_halted: per-device array with puzzle ids or -1 for non-newly-halted
+            nh = np.asarray(jax.device_get(newly_halted)).reshape(-1)
+            nh = nh[nh >= 0]
+            if nh.size:
+                # Update per-puzzle finish counts on the dataset (host-side)
+                train_ds.increment_finish_counts(nh)
+
             train_metrics.update(metrics)
             step = epoch * train_steps_per_epoch + n_batch
             ep = epoch + n_batch / train_steps_per_epoch
@@ -301,6 +332,20 @@ def train_and_evaluate(config, workdir):
         print(f"Epoch {epoch} done in {timer}. Length of this round: {step - epoch * train_steps_per_epoch + 1} steps.")
         if (epoch + 1) % config.training.log_per_epoch == 0:
             summary = train_metrics.compute_and_reset()
+            # Compute globally-weighted conditional metrics if n/d pairs exist.
+            # Use the shared denominator if present to compute weighted metrics
+            if "valid_outputs_count" in summary:
+                d = summary.pop("valid_outputs_count")
+                if "valid_pass@1_n" in summary:
+                    n = summary.pop("valid_pass@1_n")
+                    summary["valid_pass@1"] = (n / d) if d != 0 else float("nan")
+                if "q_halt_acc_n" in summary:
+                    n = summary.pop("q_halt_acc_n")
+                    summary["q_halt_acc"] = (n / d) if d != 0 else float("nan")
+                if "inference_steps_n" in summary:
+                    n = summary.pop("inference_steps_n")
+                    summary["inference_steps"] = (n / d) if d != 0 else float("nan")
+
             summary = {f"train/{k}": v for k, v in summary.items()}
             summary["epochs_per_second"] = (
                 config.training.log_per_epoch / timer.elapse_with_reset()
@@ -337,6 +382,19 @@ def train_and_evaluate(config, workdir):
                     break
             eval_time = timer.elapse_with_reset()
             eval_summary = eval_metrics.compute()
+            # compute globally-weighted metrics from n/d pairs if present
+            if "valid_outputs_count" in eval_summary:
+                d = eval_summary.pop("valid_outputs_count")
+                if "valid_pass@1_n" in eval_summary:
+                    n = eval_summary.pop("valid_pass@1_n")
+                    eval_summary["valid_pass@1"] = (n / d) if d != 0 else float("nan")
+                if "q_halt_acc_n" in eval_summary:
+                    n = eval_summary.pop("q_halt_acc_n")
+                    eval_summary["q_halt_acc"] = (n / d) if d != 0 else float("nan")
+                if "inference_steps_n" in eval_summary:
+                    n = eval_summary.pop("inference_steps_n")
+                    eval_summary["inference_steps"] = (n / d) if d != 0 else float("nan")
+
             log_for_0(f"Epoch {epoch} evaluation done. " + ", ".join([f"{k}: {v:.4f}" for k, v in eval_summary.items()]))
 
             if eval_stop_steps:

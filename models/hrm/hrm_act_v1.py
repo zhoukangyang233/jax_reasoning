@@ -33,6 +33,7 @@ class Carry:
     
     steps: jnp.ndarray
     halted: jnp.ndarray
+    finish_count: jnp.ndarray
 
     current_data: FrozenDict[str, jnp.ndarray]
 
@@ -215,6 +216,7 @@ class HRM_ACTV1(nn.Module):
             ),
             steps=jnp.zeros((batch_size, ), dtype=jnp.int32),
             halted=jnp.ones((batch_size, ), dtype=jnp.bool_),  # Default to halted
+            finish_count=jnp.zeros((batch_size, ), dtype=jnp.int32),
             current_data={
                 "inputs": jnp.zeros((batch_size, self.seq_len), dtype=jnp.int32),
                 "labels": jnp.zeros((batch_size, self.seq_len), dtype=jnp.int32),
@@ -338,7 +340,7 @@ class HRM_ACTV1(nn.Module):
 
             # Exploration
             rng, _ = jax.random.split(rng)
-            rng1, rng2 = jax.random.split(rng)
+            rng1, rng2 = jax.random.split(_)
             min_halt_steps = (jax.random.uniform(rng1, q_halt_logits.shape) < self.halt_exploration_prob) * jax.random.randint(rng2, new_steps.shape, 2, self.halt_max_steps + 1)
 
             halted = halted & (new_steps >= min_halt_steps)
@@ -356,6 +358,8 @@ class HRM_ACTV1(nn.Module):
         self.carry.value = self.carry.value.replace(
             steps=new_steps,
             halted=halted,
+            # Update finish_count: increment when a sample becomes halted this step
+            finish_count=self.carry.value.finish_count + (halted & (~self.carry.value.halted)).astype(jnp.int32),
             current_data=new_current_data
         )
         return outputs

@@ -13,4 +13,4 @@ model:
 
 dataset:
     augmentations_per_puzzle: 255
-    augmentation_refresh_interval: 5
+    augmentation_refresh_interval: 1
