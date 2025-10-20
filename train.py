@@ -353,7 +353,10 @@ def train_and_evaluate(config, workdir):
             train_metrics.update(metrics)
             step = epoch * train_steps_per_epoch + n_batch
             ep = epoch + n_batch / train_steps_per_epoch
-        train_ds.increment_finish_counts(increment_slots)
+        if increment_slots:
+            flattened_slots = [slot.ravel() for slot in increment_slots if slot.size > 0]
+            if flattened_slots:
+                train_ds.increment_finish_counts(np.concatenate(flattened_slots, axis=0))
         # Print the length of train rounds
         #print(f"Epoch {epoch} done in {timer}. Length of this round: {step - epoch * train_steps_per_epoch + 1} steps.")
         if (epoch + 1) % config.training.log_per_epoch == 0:

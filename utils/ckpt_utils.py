@@ -24,7 +24,7 @@ def convert_to_gs(path):
 
     pref = 'kmh-gcp-us-central2'
     out = '/' + '/'.join(subpaths[3:])
-    out = f'gs://{pref}/kangyang_files' + out
+    out = f'gs://{pref}/qiao_zhicheng_hanhong_files' + out
     return out
 
 def exist_general(path):
