@@ -1,23 +1,22 @@
 # credit: https://github.com/sapientinc/HRM
-import pydantic
-import numpy as np
-
 from typing import List, Optional
 
-import os
-import json
 import copy
-
-import numpy as np
-import pydantic
-import random
 import itertools
+import json
+import os
+import random
+import tempfile
+import uuid
 from functools import partial
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pydantic
 import torch
-from torch.utils.data import Dataset, get_worker_info
+
+from torch.utils.data import Dataset
 from utils.logging_util import log_for_0, log_for_all
 
 IGNORE_LABEL_ID = -100 # TODO{zhh}: check how this is used?
@@ -26,15 +25,16 @@ class PuzzleDatasetMetadata(pydantic.BaseModel):
     pad_id: int
     ignore_label_id: Optional[int]
     blank_identifier_id: int
-    
+
     vocab_size: int
     seq_len: int
     num_puzzle_identifiers: int
-    
+
     total_groups: int
     mean_puzzle_examples: float
 
     sets: List[str]
+    augmentations_per_puzzle: Optional[int] = 0
 
 class PuzzleDataset(Dataset):
     FIELD_MMAP_MODES = {
@@ -50,7 +50,10 @@ class PuzzleDataset(Dataset):
         self._data = {}
         self.config = config
         self.split = split
+        self.augmentations_per_puzzle = int(getattr(config, "augmentations_per_puzzle", 0))
         self.metadata: PuzzleDatasetMetadata = self._load_metadata()
+        # Ensure metadata.augmentations_per_puzzle is set correctly
+        self.metadata.augmentations_per_puzzle = self.augmentations_per_puzzle
         
         assert len(self.metadata.sets) == 1, "Currently only single set supported."
         log_for_0(f'Loading dataset...')
@@ -62,7 +65,6 @@ class PuzzleDataset(Dataset):
             }
         log_for_0(f'Dataset loaded.')
 
-        self.augmentations_per_puzzle = int(getattr(config, "augmentations_per_puzzle", 0))
         if self.augmentations_per_puzzle < 0:
             raise ValueError(f"augmentations_per_puzzle must be >= 0, got {self.augmentations_per_puzzle}")
         self.augmentation_refresh_interval = int(getattr(config, "augmentation_refresh_interval", 0))
@@ -79,10 +81,17 @@ class PuzzleDataset(Dataset):
         self._base_len = len(self._data['inputs'])
         self._length = self._base_len * (self.augmentations_per_puzzle + 1)
 
-        self._augmentation_epoch = 0
-        # Per-puzzle finish counts (used to trigger augmentation refresh when puzzles complete)
-        # Shape: (base_len,) integers
-        self._augmentation_usage_counts = np.zeros((self._base_len,), dtype=np.int32)
+        # Per augmentation finish counts (used to trigger augmentation refresh when puzzles complete).
+        # Stored in a shared memmap so updates from the training process are visible to DataLoader workers.
+        self._augmentation_usage_counts = None
+        self._augmentation_counts_shape = (self._base_len * self.augmentations_per_puzzle,)
+        self._augmentation_counts_path = None
+        if self.augmentations_per_puzzle:
+            self._augmentation_counts_path = os.path.join(
+                tempfile.gettempdir(),
+                f"aug_counts_{uuid.uuid4().hex}.dat",
+            )
+            self._open_shared_augmentation_counts(create=True)
 
         if self.augmentations_per_puzzle:
             self.metadata.total_groups = self._length
@@ -106,6 +115,7 @@ class PuzzleDataset(Dataset):
         labels = np.array(self._data['labels'][base_index], copy=True)
         puzzle_identifier = np.array(self._data['puzzle_identifiers'][base_index])
 
+        aug_slot = -1
         if augmentation_index > 0 and self.augmentations_per_puzzle:
             inputs, labels = self._augment_example(
                 inputs,
@@ -113,9 +123,18 @@ class PuzzleDataset(Dataset):
                 augmentation_index - 1,
                 base_index,
             )
+            aug_slot = augmentation_index - 1
+        elif self.augmentations_per_puzzle > 0:
+            aug_slot = -1
 
-        t = (inputs, labels, puzzle_identifier)
-        return tuple(torch.from_numpy(x.astype('int32')) for x in t)
+        tensors = (
+            torch.from_numpy(inputs.astype(np.int32, copy=False)),
+            torch.from_numpy(labels.astype(np.int32, copy=False)),
+            torch.from_numpy(np.asarray(puzzle_identifier, dtype=np.int32)),
+            torch.tensor(base_index, dtype=torch.int32),
+            torch.tensor(aug_slot, dtype=torch.int32),
+        )
+        return tensors
 
     def __len__(self):
         return self._length
@@ -131,54 +150,61 @@ class PuzzleDataset(Dataset):
         aug_index = int(aug_index)
         base_seed = (base_index + 1) * 1000 + aug_index
 
-        # If refresh is requested, compute refresh id deterministically from
-        # the externally provided epoch. This is safe with multiple DataLoader
-        # workers because the epoch is set from the parent process.
+        flat_index = base_index * self.augmentations_per_puzzle + aug_index
         if self.augmentation_refresh_interval > 0:
-            # Compute epoch-based refresh id
-            refresh_id = int(self._augmentation_epoch) // self.augmentation_refresh_interval
-            seed = base_seed + refresh_id * self._augmentation_seed_stride
-
-            # Additionally, if this specific base puzzle's finish_count reached a multiple of
-            # augmentation_refresh_interval, incorporate that into the refresh id so its
-            # augmented variants will rotate.
-            fc = int(self._augmentation_usage_counts[base_index])
-            if self.augmentation_refresh_interval > 0 and fc > 0 and (fc % self.augmentation_refresh_interval) == 0:
-                # change refresh id deterministically for this puzzle
-                seed = seed + (fc // self.augmentation_refresh_interval + 1) * (self._augmentation_seed_stride // 2)
-
-            return np.random.default_rng(seed)
-
-        return np.random.default_rng(base_seed)
-
-    def set_augmentation_epoch(self, epoch: int):
-        """Set the current epoch used to compute augmentation refresh ids.
-
-        Call this once per training epoch (from the main process) with the
-        current epoch number. This keeps augmentation refresh deterministic
-        and correct when using multi-worker DataLoader.
-        """
-        self._augmentation_epoch = int(epoch)
+            refresh_id = int(self._augmentation_usage_counts[flat_index]) // self.augmentation_refresh_interval
+        else:
+            refresh_id = 0
+        seed = base_seed + refresh_id * self._augmentation_seed_stride
+        return np.random.default_rng(seed)
     
     def __str__(self):
         md = '\n\t\t'.join([f"{k}: {v}" for k, v in self.metadata.model_dump().items()])
         return f"{self.__class__.__name__}\n\t- split: {self.split}\n\t- size: {len(self)}\n\t- metadata:\n\t\t{md}"
 
-    def increment_finish_counts(self, puzzle_ids):
-        """Increment per-puzzle finish counts for the provided base puzzle ids.
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        counts = state.pop("_augmentation_usage_counts", None)
+        if counts is not None and isinstance(counts, np.memmap):
+            counts.flush()
+        return state
 
-        puzzle_ids: a 1-D numpy array or list of base indices. Values < 0 are ignored.
-        """
-        if puzzle_ids is None:
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if self.augmentations_per_puzzle:
+            self._open_shared_augmentation_counts(create=False)
+
+    def increment_finish_counts(self, augmentation_ids):
+        """Increment finish counts for provided flattened augmentation ids."""
+        if augmentation_ids is None or self.augmentations_per_puzzle <= 0:
             return
-        ids = np.asarray(puzzle_ids).ravel()
-        # ignore negative ids
-        ids = ids[ids >= 0]
+        ids = np.asarray(augmentation_ids).ravel()
+        max_slots = self._augmentation_usage_counts.size
+        mask = (ids >= 0) & (ids < max_slots)
+        ids = ids[mask]
         if ids.size == 0:
             return
-        # Count occurrences and add
-        unique, counts = np.unique(ids, return_counts=True)
-        self._augmentation_usage_counts[unique] += counts.astype(np.int32)
+        np.add.at(self._augmentation_usage_counts, ids, 1)
+        if hasattr(self._augmentation_usage_counts, "flush"):
+            self._augmentation_usage_counts.flush()
+
+    def _open_shared_augmentation_counts(self, create: bool):
+        if not self.augmentations_per_puzzle:
+            return
+        shape = self._augmentation_counts_shape
+        if shape[0] == 0:
+            self._augmentation_usage_counts = np.zeros(shape, dtype=np.int32)
+            return
+        if self._augmentation_counts_path is None:
+            raise RuntimeError("Missing augmentation counts path for shared storage.")
+        if create is False and not os.path.exists(self._augmentation_counts_path):
+            create = True
+        mode = 'w+' if create else 'r+'
+        counts = np.memmap(self._augmentation_counts_path, dtype=np.int32, mode=mode, shape=shape)
+        if create:
+            counts[:] = 0
+            counts.flush()
+        self._augmentation_usage_counts = counts
 
 class SudokuDataset(PuzzleDataset):
     def _load_metadata(self):
@@ -202,6 +228,9 @@ class SudokuDataset(PuzzleDataset):
 
     def _augment_example(self, inputs, labels, aug_index, base_index):
         rng = self._next_augmentation_rng(base_index, aug_index)
+        if aug_index == 0 and base_index == 0:
+            log_for_all(f"Augmenting example with random number: {aug_index}, {base_index}, {rng.integers(0, 1_000_000_000)}")
+            #print("Augmenting example with random number: ", aug_index, base_index, rng.integers(0, 1_000_000_000))
         board_inputs = inputs.reshape(9, 9)
         board_labels = labels.reshape(9, 9)
 
@@ -230,7 +259,15 @@ class SudokuDataset(PuzzleDataset):
 
         vocab_size = self.metadata.vocab_size
         mapping = np.arange(vocab_size, dtype=board_labels.dtype)
-        digit_tokens = np.arange(1, min(vocab_size, 10), dtype=board_labels.dtype)
+        digit_tokens = np.unique(board_labels)
+        if self.metadata.pad_id is not None:
+            digit_tokens = digit_tokens[digit_tokens != self.metadata.pad_id]
+        if (
+            self.metadata.ignore_label_id is not None
+            and self.metadata.ignore_label_id >= 0
+            and self.metadata.ignore_label_id < vocab_size
+        ):
+            digit_tokens = digit_tokens[digit_tokens != self.metadata.ignore_label_id]
         if digit_tokens.size:
             mapping[digit_tokens] = rng.permutation(digit_tokens)
 
@@ -413,30 +450,52 @@ def worker_init_fn(worker_id, rank):
     np.random.seed(seed)
 
 def prepare_batch_data(batch, batch_size=None, dataset_metdata=None):
-    # image, label = batch
-    inputs, labels, puzzle_identifiers = batch
-    assert inputs.shape[0] == labels.shape[0] == puzzle_identifiers.shape[0]
+    try:
+        inputs, labels, puzzle_identifiers, base_indices, augmentation_indices = batch
+    except ValueError as exc:
+        raise ValueError(
+            "Dataset must provide (inputs, labels, puzzle_identifiers, base_indices, augmentation_indices)."
+        ) from exc
+
+    assert (
+        inputs.shape[0]
+        == labels.shape[0]
+        == puzzle_identifiers.shape[0]
+        == base_indices.shape[0]
+        == augmentation_indices.shape[0]
+    ), "Mismatched batch dimensions"
     
     metadata = dataset_metdata
     if metadata.ignore_label_id is not None:
         labels[labels == metadata.ignore_label_id] = IGNORE_LABEL_ID
     
-    batch = {"inputs": inputs, "labels": labels, "puzzle_identifiers": puzzle_identifiers, 'zhh_is_pad': labels * 0}
+    batch = {
+        "inputs": inputs,
+        "labels": labels,
+        "puzzle_identifiers": puzzle_identifiers,
+        "base_puzzle_indices": base_indices,
+        "augmentation_indices": augmentation_indices,
+        'zhh_is_pad': labels * 0
+    }
     # pad the batch if smaller than batch_size
     if batch_size is not None and batch_size > puzzle_identifiers.shape[0]:
         pad_values = {
             # "inputs": metadata.pad_id,
             "labels": IGNORE_LABEL_ID,
             "puzzle_identifiers": metadata.blank_identifier_id,
+            "base_puzzle_indices": -1,
+            "augmentation_indices": -1,
             'zhh_is_pad': 1,
         }
         pad_size = batch_size - puzzle_identifiers.shape[0]
         inputs = batch["inputs"]
-        batch = {k: torch.cat([v, torch.full((pad_size, ) + v.shape[1:], pad_values[k], dtype=v.dtype)], dim=0) for k, v in batch.items() if k in pad_values}
-        
         # NOTE{zhh}: this is a hack, pad inputs with last input, avoid bad inputs influence halt time
         assert inputs.ndim == 2, f"inputs should be 2D, got {inputs.shape}"
         batch["inputs"] = torch.cat([inputs, inputs[-1:].repeat(pad_size, 1)], dim=0)
+        for key, pad_value in pad_values.items():
+            value = batch[key]
+            pad_tensor = torch.full((pad_size, ) + value.shape[1:], pad_value, dtype=value.dtype)
+            batch[key] = torch.cat([value, pad_tensor], dim=0)
 
     LDC = jax.local_device_count()
     return {k: (v.reshape((LDC, -1) + v.shape[1:])).numpy() for k, v in batch.items()}
@@ -475,13 +534,45 @@ def inverse_dihedral_transform(arr: np.ndarray, tid: int) -> np.ndarray:
 
 if __name__ == "__main__":
     config = lambda: None
-    config.dataset_path = "/kmh-nfs-ssd-us-mount/data/sudoku-extreme-full"
+    config.augmentations_per_puzzle = 2
+    config.augmentation_refresh_interval = 1
+    config.dataset_path = "/kmh-nfs-ssd-us-mount/data/sudoku-extreme-1k"
     # Test
     ds = SudokuDataset(config, "train")
     print(ds)
-    for i in range(3):
-        inp, out, pid = ds[i]
-        print(inp.shape, out.shape, pid.shape)
-        print(inp)
-        print(out)
-        print(pid)
+    for t in range(1):
+        inp, out, pid, base_idx, aug_idx = ds[t]
+        print(inp.shape, out.shape, pid.shape, base_idx.shape, aug_idx.shape)
+        for i in range(9):
+            for j in range(9):
+                print(f"{inp[i*9 + j]}", end=' ')
+            print()
+        #print(inp)
+        #print(out)
+        #print(pid)
+        #print(base_idx, aug_idx)
+    # Test for augmentation
+    for t in range(1):
+        inp, out, pid, base_idx, aug_idx = ds[1000 + t]
+        print("Augmented:")
+        for i in range(9):
+            for j in range(9):
+                print(f"{out[i*9 + j]}", end=' ')
+            print()
+        #print(inp)
+        #print(out)
+        #print(pid)
+        #print(base_idx, aug_idx)
+
+    # Test for increment_finish_counts
+    aug_ids = [0, 1, 2, 3, 4, 5]
+    print("Before increment:", ds._augmentation_usage_counts[aug_ids])
+    ds.increment_finish_counts(aug_ids)
+    print("After increment:", ds._augmentation_usage_counts[aug_ids])
+    for t in range(1):
+        inp, out, pid, base_idx, aug_idx = ds[1000 + t]
+        print("Augmented:")
+        for i in range(9):
+            for j in range(9):
+                print(f"{out[i*9 + j]}", end=' ')
+            print()

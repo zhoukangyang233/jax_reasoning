@@ -220,7 +220,9 @@ class HRM_ACTV1(nn.Module):
             current_data={
                 "inputs": jnp.zeros((batch_size, self.seq_len), dtype=jnp.int32),
                 "labels": jnp.zeros((batch_size, self.seq_len), dtype=jnp.int32),
-                "puzzle_identifiers": jnp.zeros((batch_size,), dtype=jnp.int32)
+                "puzzle_identifiers": jnp.zeros((batch_size,), dtype=jnp.int32),
+                "base_puzzle_indices": jnp.zeros((batch_size,), dtype=jnp.int32),
+                "augmentation_indices": jnp.full((batch_size,), -1, dtype=jnp.int32),
             }
         )
 

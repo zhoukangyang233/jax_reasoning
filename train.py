@@ -46,6 +46,8 @@ def create_train_state(rng, config, total_steps, batch_size):
         'inputs': (2, config.dataset.seq_len),
         'labels': (2, config.dataset.seq_len),
         'puzzle_identifiers': (2,),
+        'base_puzzle_indices': (2,),
+        'augmentation_indices': (2,),
     }
     fake_batch = {k: jnp.ones(v, dtype=jnp.int32) for k, v in fake_batch_shape.items()}
     
@@ -174,7 +176,7 @@ def compute_metrics(dict_losses):
     metrics = jax.tree_map(lambda x: x.flatten(), metrics)  # (batch_size,)
     return metrics
 
-def train_step(state: MutableTrainState, batch, loss_fn, init_rng, model, lr_fn):
+def train_step(state: MutableTrainState, batch, loss_fn, init_rng, model, lr_fn, augmentations_per_puzzle: int):
     rng_step = jax.random.fold_in(init_rng, state.step)
     def L(params):
         variables = {'params': params, 'buffer': state.buffers, 'const': state.consts}
@@ -190,12 +192,19 @@ def train_step(state: MutableTrainState, batch, loss_fn, init_rng, model, lr_fn)
     # Compute which samples newly halted on this step (per-device)
     old_carry = state.buffers['carry']
     new_carry = new_buffers['carry']
-    newly_halted_mask = (new_carry.halted & (~old_carry.halted)).astype(jnp.int32)
-    # puzzle identifiers to report
-    puzzle_ids = new_carry.current_data['puzzle_identifiers'].astype(jnp.int32)
-    newly_halted_ids = jnp.where(newly_halted_mask, puzzle_ids, -1).astype(jnp.int32)
+    newly_halted_bool = new_carry.halted & (~old_carry.halted)
+    # puzzle identifiers and augmentation indices to report
+    base_indices = new_carry.current_data['base_puzzle_indices'].astype(jnp.int32)
+    aug_indices = new_carry.current_data['augmentation_indices'].astype(jnp.int32)
+    aug_factor = jnp.int32(augmentations_per_puzzle)
+    valid_aug_mask = newly_halted_bool & (aug_indices >= 0)
+    newly_halted_aug_slots = jnp.where(
+        valid_aug_mask,
+        base_indices * aug_factor + aug_indices,
+        -1,
+    ).astype(jnp.int32)
 
-    return new_state, compute_metrics(metrics), vis, newly_halted_ids
+    return new_state, compute_metrics(metrics), vis, newly_halted_aug_slots
 
 def eval_step(state: MutableTrainState, batch, loss_fn, model):
     variables = {'params': state.params, 'buffer': state.buffers, 'const': state.consts}
@@ -281,7 +290,21 @@ def train_and_evaluate(config, workdir):
     # compile train_step, eval_step
     loss_fn = LOSS_FUNCTIONS[config.training.loss_fn]
     rng, train_rng = jax.random.split(rng)
-    p_train_step = jax.pmap(partial(train_step, loss_fn=loss_fn, init_rng=train_rng, model=model, lr_fn=lr_fn), axis_name='batch', donate_argnums=(0,))
+    augmentations_per_puzzle = getattr(
+        train_metadata, "augmentations_per_puzzle", getattr(dataset_cfg, "augmentations_per_puzzle", 0)
+    )
+    p_train_step = jax.pmap(
+        partial(
+            train_step,
+            loss_fn=loss_fn,
+            init_rng=train_rng,
+            model=model,
+            lr_fn=lr_fn,
+            augmentations_per_puzzle=augmentations_per_puzzle,
+        ),
+        axis_name='batch',
+        donate_argnums=(0,),
+    )
     p_eval_step = jax.pmap(partial(eval_step, loss_fn=loss_fn, model=model), axis_name='batch')
     test_batch = input_pipeline.prepare_batch_data(next(iter(train_dl)), batch_size=device_batch_size, dataset_metdata=train_metadata)
     log_for_0("Compiling p_train_step and p_eval_step ...")
@@ -313,23 +336,26 @@ def train_and_evaluate(config, workdir):
         log_for_0(f"Epoch {epoch} ...")
         step = epoch * train_steps_per_epoch
         ep = epoch
+        increment_slots = []
         for n_batch, batch in enumerate(train_dl):
             batch = input_pipeline.prepare_batch_data(batch, batch_size=device_batch_size,
              dataset_metdata=train_metadata)
             #log_for_0(f"Prepared batch {n_batch} for training in epoch {epoch}.")
-            state, metrics, vis, newly_halted = p_train_step(state, batch)
-            # newly_halted: per-device array with puzzle ids or -1 for non-newly-halted
-            nh = np.asarray(jax.device_get(newly_halted)).reshape(-1)
-            nh = nh[nh >= 0]
-            if nh.size:
-                # Update per-puzzle finish counts on the dataset (host-side)
-                train_ds.increment_finish_counts(nh)
+            state, metrics, vis, newly_halted_aug_slots = p_train_step(state, batch)
+            # newly_halted_aug_slots: per-device arrays with flattened augmentation ids (-1 marks non-augmented or non-halted)
+            nh_slots = np.asarray(jax.device_get(newly_halted_aug_slots)).reshape(-1)
+            nh_slots = nh_slots[nh_slots >= 0]
+            if nh_slots.size:
+                # Update per-augmentation finish counts on the dataset (host-side)
+                # train_ds.increment_finish_counts(nh_slots)
+                increment_slots.append(nh_slots)
 
             train_metrics.update(metrics)
             step = epoch * train_steps_per_epoch + n_batch
             ep = epoch + n_batch / train_steps_per_epoch
+        train_ds.increment_finish_counts(increment_slots)
         # Print the length of train rounds
-        print(f"Epoch {epoch} done in {timer}. Length of this round: {step - epoch * train_steps_per_epoch + 1} steps.")
+        #print(f"Epoch {epoch} done in {timer}. Length of this round: {step - epoch * train_steps_per_epoch + 1} steps.")
         if (epoch + 1) % config.training.log_per_epoch == 0:
             summary = train_metrics.compute_and_reset()
             # Compute globally-weighted conditional metrics if n/d pairs exist.
