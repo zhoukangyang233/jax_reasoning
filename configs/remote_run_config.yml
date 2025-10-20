@@ -3,8 +3,11 @@ training:
     eval_batch_size: 512
     epochs: 2000
     log_per_epoch: 1
-    eval_interval: 10
-    checkpoint_interval: 10
+    eval_interval: 2
+    checkpoint_interval: 2
+    eval_split: 'test'
+    eval_augmentations_per_puzzle: 0
+    learning_rate: 0.00006
 
     optimizer: adam_atan2
 
@@ -12,5 +15,5 @@ model:
     name: HRM_default
 
 dataset:
-    augmentations_per_puzzle: 255
+    augmentations_per_puzzle: 356
     augmentation_refresh_interval: 1

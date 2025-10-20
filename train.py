@@ -268,9 +268,23 @@ def train_and_evaluate(config, workdir):
     device_eval_batch_size = global_eval_batch_size // PCC
     assert global_batch_size % (PCC) == 0 and device_batch_size % LDC == 0, f"global_batch_size: {global_batch_size}, PCC: {PCC}, LDC: {LDC}, local_batch_size: {device_batch_size}"
     assert global_eval_batch_size % (PCC) == 0 and device_eval_batch_size % LDC == 0, f"global_eval_batch_size: {global_eval_batch_size}, PCC: {PCC}, LDC: {LDC}, local_eval_batch_size: {device_eval_batch_size}"
-    train_dl, train_steps_per_epoch, train_metadata, train_ds = input_pipeline.create_split(dataset_cfg, split='train', batch_size=device_batch_size)
-    eval_dl, eval_steps_per_epoch, eval_metadata, eval_ds = input_pipeline.create_split(dataset_cfg, split='test', batch_size=device_eval_batch_size)
-    log_for_0(f"train_steps_per_epoch: {train_steps_per_epoch}, eval_steps_per_epoch: {eval_steps_per_epoch}")
+    eval_split = getattr(config.training, "eval_split", "test")
+    train_dl, train_steps_per_epoch, train_metadata, train_ds = input_pipeline.create_split(
+        dataset_cfg, split='train', batch_size=device_batch_size
+    )
+    eval_dataset_overrides = None
+    if eval_split == 'train':
+        eval_dataset_overrides = {
+            "augmentations_per_puzzle": int(getattr(config.training, "eval_augmentations_per_puzzle", 0))
+        }
+    eval_dl, eval_steps_per_epoch, eval_metadata, eval_ds = input_pipeline.create_split(
+        dataset_cfg,
+        split=eval_split,
+        batch_size=device_eval_batch_size,
+        dataset_overrides=eval_dataset_overrides,
+        shuffle=False,
+    )
+    log_for_0(f"train_steps_per_epoch: {train_steps_per_epoch}, eval_steps_per_epoch ({eval_split}): {eval_steps_per_epoch}")
     total_steps = config.training.epochs * train_steps_per_epoch
     
     # init model
@@ -359,7 +373,7 @@ def train_and_evaluate(config, workdir):
                 train_ds.increment_finish_counts(np.concatenate(flattened_slots, axis=0))
         # Print the length of train rounds
         #print(f"Epoch {epoch} done in {timer}. Length of this round: {step - epoch * train_steps_per_epoch + 1} steps.")
-        if (epoch + 1) % config.training.log_per_epoch == 0:
+        if (epoch + 1) % config.training.log_per_epoch == 0 and not config.just_evaluate:
             summary = train_metrics.compute_and_reset()
             # Compute globally-weighted conditional metrics if n/d pairs exist.
             # Use the shared denominator if present to compute weighted metrics

@@ -156,6 +156,7 @@ class PuzzleDataset(Dataset):
         else:
             refresh_id = 0
         seed = base_seed + refresh_id * self._augmentation_seed_stride
+        seed += 11114514
         return np.random.default_rng(seed)
     
     def __str__(self):
@@ -345,28 +346,57 @@ def create_split(
     dataset_cfg,
     batch_size,
     split,
+    *,
+    dataset_overrides=None,
+    shuffle=None,
     # num_merge_epochs=-1
 ):
-    """Creates a split from the ImageNet dataset using Torchvision Datasets.
+    """Creates a split from the dataset using Torchvision Datasets.
 
     Args:
       dataset_cfg: Configurations for the dataset.
       batch_size: Batch size for the dataloader.
-      split: 'train' or 'val'.
+      split: 'train' or 'test'.
+      dataset_overrides: Optional dict of overrides applied to the dataset config
+        before instantiation (e.g. different augmentation settings).
+      shuffle: Optional explicit shuffle flag for the DistributedSampler.
     Returns:
       it: A PyTorch Dataloader.
       steps_per_epoch: Number of steps to loop through the DataLoader.
     """
     rank = jax.process_index()
     dataset_cls = DATASET_CONFIG_TO_CLS.get(dataset_cfg.dataset_cls, lambda *args, **kwargs: exec('raise ValueError(f"Unknown dataset class {dataset_cfg.dataset_cls}.")'))
+    dataset_cfg_for_split = dataset_cfg
+    actual_split = split
+    local_overrides = dataset_overrides or {}
+    if split == 'test':
+        dataset_cfg_for_split = copy.deepcopy(dataset_cfg)
+        if hasattr(dataset_cfg_for_split, "augmentations_per_puzzle"):
+            dataset_cfg_for_split.augmentations_per_puzzle = 0  # disable augmentation for evaluation
+        actual_split = 'test'
+    elif split == 'train':
+        if local_overrides:
+            dataset_cfg_for_split = copy.deepcopy(dataset_cfg)
+        actual_split = 'train'
+    else:
+        raise ValueError(f"Unknown split {split}.")
+
+    if local_overrides:
+        for field, value in local_overrides.items():
+            setattr(dataset_cfg_for_split, field, value)
+        log_for_0(f"Applied dataset overrides for split '{split}': {local_overrides}")
+
+    if shuffle is None:
+        shuffle = (split == 'train') and not local_overrides
+
     if split == 'train':
-        ds = dataset_cls(config=dataset_cfg, split=split)
+        ds = dataset_cls(config=dataset_cfg_for_split, split=actual_split)
         log_for_0(f'\n{ds}')
         sampler = torch.utils.data.distributed.DistributedSampler(
             ds,
             num_replicas=jax.process_count(),
             rank=rank,
-            shuffle=True,
+            shuffle=shuffle,
         )
         it = torch.utils.data.DataLoader(
             ds,
@@ -383,16 +413,13 @@ def create_split(
         )
         steps_per_epoch = len(it)
     elif split == 'test':
-        test_dataset_cfg = copy.deepcopy(dataset_cfg)
-        if hasattr(test_dataset_cfg, "augmentations_per_puzzle"):
-            test_dataset_cfg.augmentations_per_puzzle = 0  # disable augmentation for evaluation
-        ds = dataset_cls(config=test_dataset_cfg, split=split)
+        ds = dataset_cls(config=dataset_cfg_for_split, split=actual_split)
         log_for_0(ds)
         sampler = torch.utils.data.distributed.DistributedSampler(
             ds,
             num_replicas=jax.process_count(),
             rank=rank,
-            shuffle=False,  # don't shuffle for test
+            shuffle=shuffle,  # don't shuffle for test / eval
         )
         it = torch.utils.data.DataLoader(
             ds,

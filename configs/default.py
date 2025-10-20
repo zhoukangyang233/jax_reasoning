@@ -30,6 +30,8 @@ def get_config():
     training.log_per_epoch = 10
     training.num_vis = 4
     training.eval_interval = 10_000
+    training.eval_split = 'test'
+    training.eval_augmentations_per_puzzle = 0
     training.checkpoint_interval = 10_000
     training.loss_fn = 'stablemax_cross_entropy'
     
