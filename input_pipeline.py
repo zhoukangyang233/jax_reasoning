@@ -6,8 +6,6 @@ import itertools
 import json
 import os
 import random
-import tempfile
-import uuid
 from functools import partial
 
 import jax
@@ -67,41 +65,14 @@ class PuzzleDataset(Dataset):
 
         if self.augmentations_per_puzzle < 0:
             raise ValueError(f"augmentations_per_puzzle must be >= 0, got {self.augmentations_per_puzzle}")
-        self.augmentation_refresh_interval = int(getattr(config, "augmentation_refresh_interval", 0))
-        if self.augmentation_refresh_interval < 0:
-            raise ValueError(
-                f"augmentation_refresh_interval must be >= 0, got {self.augmentation_refresh_interval}"
-            )
-        self._augmentation_seed_stride = int(getattr(config, "augmentation_seed_stride", 1_000_003))
-        if self._augmentation_seed_stride <= 0:
-            raise ValueError(
-                f"augmentation_seed_stride must be > 0, got {self._augmentation_seed_stride}"
-            )
-
         self._base_len = len(self._data['inputs'])
         self._length = self._base_len * (self.augmentations_per_puzzle + 1)
-
-        # Per augmentation finish counts (used to trigger augmentation refresh when puzzles complete).
-        # Stored in a shared memmap so updates from the training process are visible to DataLoader workers.
-        self._augmentation_usage_counts = None
-        self._augmentation_counts_shape = (self._base_len * self.augmentations_per_puzzle,)
-        self._augmentation_counts_path = None
-        if self.augmentations_per_puzzle:
-            self._augmentation_counts_path = os.path.join(
-                tempfile.gettempdir(),
-                f"aug_counts_{uuid.uuid4().hex}.dat",
-            )
-            self._open_shared_augmentation_counts(create=True)
 
         if self.augmentations_per_puzzle:
             self.metadata.total_groups = self._length
             log_for_0(
                 f"Applying {self.augmentations_per_puzzle} augmentations per puzzle; effective dataset size {self._length}."
             )
-            if self.augmentation_refresh_interval > 0:
-                log_for_0(
-                    f"Refresh augmented variants every {self.augmentation_refresh_interval} epoch(s)."
-                )
         elif self._length != self.metadata.total_groups:
             log_for_0(
                 f"\033[31mWARNING: Dataset size {self._length} does not match metadata {self.metadata.total_groups}.\033[0m"
@@ -149,63 +120,12 @@ class PuzzleDataset(Dataset):
         base_index = int(base_index)
         aug_index = int(aug_index)
         base_seed = (base_index + 1) * 1000 + aug_index
-
-        flat_index = base_index * self.augmentations_per_puzzle + aug_index
-        if self.augmentation_refresh_interval > 0:
-            refresh_id = int(self._augmentation_usage_counts[flat_index]) // self.augmentation_refresh_interval
-        else:
-            refresh_id = 0
-        seed = base_seed + refresh_id * self._augmentation_seed_stride
-        seed += 11114514
+        seed = base_seed + 11114514
         return np.random.default_rng(seed)
     
     def __str__(self):
         md = '\n\t\t'.join([f"{k}: {v}" for k, v in self.metadata.model_dump().items()])
         return f"{self.__class__.__name__}\n\t- split: {self.split}\n\t- size: {len(self)}\n\t- metadata:\n\t\t{md}"
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        counts = state.pop("_augmentation_usage_counts", None)
-        if counts is not None and isinstance(counts, np.memmap):
-            counts.flush()
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        if self.augmentations_per_puzzle:
-            self._open_shared_augmentation_counts(create=False)
-
-    def increment_finish_counts(self, augmentation_ids):
-        """Increment finish counts for provided flattened augmentation ids."""
-        if augmentation_ids is None or self.augmentations_per_puzzle <= 0:
-            return
-        ids = np.asarray(augmentation_ids).ravel()
-        max_slots = self._augmentation_usage_counts.size
-        mask = (ids >= 0) & (ids < max_slots)
-        ids = ids[mask]
-        if ids.size == 0:
-            return
-        np.add.at(self._augmentation_usage_counts, ids, 1)
-        if hasattr(self._augmentation_usage_counts, "flush"):
-            self._augmentation_usage_counts.flush()
-
-    def _open_shared_augmentation_counts(self, create: bool):
-        if not self.augmentations_per_puzzle:
-            return
-        shape = self._augmentation_counts_shape
-        if shape[0] == 0:
-            self._augmentation_usage_counts = np.zeros(shape, dtype=np.int32)
-            return
-        if self._augmentation_counts_path is None:
-            raise RuntimeError("Missing augmentation counts path for shared storage.")
-        if create is False and not os.path.exists(self._augmentation_counts_path):
-            create = True
-        mode = 'w+' if create else 'r+'
-        counts = np.memmap(self._augmentation_counts_path, dtype=np.int32, mode=mode, shape=shape)
-        if create:
-            counts[:] = 0
-            counts.flush()
-        self._augmentation_usage_counts = counts
 
 class SudokuDataset(PuzzleDataset):
     def _load_metadata(self):
@@ -438,6 +358,8 @@ def create_split(
     else:
         raise ValueError(f"Unknown split {split}.")
     log_for_all(f'Dataset is loaded')
+    # print the dataset sizes
+    log_for_all(f'Dataset split "{split}" has {len(ds)} examples, {steps_per_epoch} steps per epoch with batch size {batch_size}.')
     return it, steps_per_epoch, ds.metadata, ds
 
 
@@ -562,7 +484,6 @@ def inverse_dihedral_transform(arr: np.ndarray, tid: int) -> np.ndarray:
 if __name__ == "__main__":
     config = lambda: None
     config.augmentations_per_puzzle = 2
-    config.augmentation_refresh_interval = 1
     config.dataset_path = "/kmh-nfs-ssd-us-mount/data/sudoku-extreme-1k"
     # Test
     ds = SudokuDataset(config, "train")
@@ -579,23 +500,6 @@ if __name__ == "__main__":
         #print(pid)
         #print(base_idx, aug_idx)
     # Test for augmentation
-    for t in range(1):
-        inp, out, pid, base_idx, aug_idx = ds[1000 + t]
-        print("Augmented:")
-        for i in range(9):
-            for j in range(9):
-                print(f"{out[i*9 + j]}", end=' ')
-            print()
-        #print(inp)
-        #print(out)
-        #print(pid)
-        #print(base_idx, aug_idx)
-
-    # Test for increment_finish_counts
-    aug_ids = [0, 1, 2, 3, 4, 5]
-    print("Before increment:", ds._augmentation_usage_counts[aug_ids])
-    ds.increment_finish_counts(aug_ids)
-    print("After increment:", ds._augmentation_usage_counts[aug_ids])
     for t in range(1):
         inp, out, pid, base_idx, aug_idx = ds[1000 + t]
         print("Augmented:")

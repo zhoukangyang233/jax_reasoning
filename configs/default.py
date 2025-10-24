@@ -8,7 +8,6 @@ def get_config():
     dataset.dataset_cls = "sudoku"
     dataset.dataset_path = "/kmh-nfs-ssd-us-mount/data/sudoku-extreme-1k"
     dataset.augmentations_per_puzzle = 0
-    dataset.augmentation_refresh_interval = 0
     
     dataset.seq_len = 81
     dataset.vocab_size = 11
